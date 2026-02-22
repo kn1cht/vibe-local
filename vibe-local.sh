@@ -184,7 +184,7 @@ done
 if [ "$AUTO_MODE" -eq 1 ]; then
     if check_network; then
         echo "🌐 ネットワーク接続あり → 通常の Claude Code を起動"
-        exec claude "${EXTRA_ARGS[@]}"
+        exec claude ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
     else
         echo "📡 ネットワーク接続なし → ローカルモード ($MODEL)"
     fi
@@ -282,4 +282,4 @@ echo ""
 
 ANTHROPIC_BASE_URL="$PROXY_URL" \
 ANTHROPIC_API_KEY="local" \
-exec claude --model "$MODEL" "${PERM_ARGS[@]}" "${EXTRA_ARGS[@]}"
+exec claude --model "$MODEL" ${PERM_ARGS[@]+"${PERM_ARGS[@]}"} ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
