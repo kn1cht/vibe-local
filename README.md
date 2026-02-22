@@ -152,7 +152,6 @@ AIは かんぺきでは ありません。まちがった コマンドを う�
 
 | きけんな キーワード | なぜ あぶない？ |
 |---|---|
-| `rm` が はいっている | ファイルが きえる かもしれない |
 | `sudo` で はじまる | パソコンの だいじな せっていが かわる |
 | `chmod` が はいっている | ファイルの まもりが なくなる |
 | いみが わからない ながい コマンド | なにが おきるか わからない！ |
@@ -361,7 +360,6 @@ AIが提案するコマンドの中に以下のキーワードが含まれてい
 | 注意すべきキーワード | リスク |
 |---|---|
 | `sudo` で始まるコマンド | システム全体に影響する管理者権限での操作 |
-| `rm` を含む削除系コマンド | ファイルやフォルダが消える（元に戻せないことも） |
 | `chmod` / `chown` | ファイルの権限やセキュリティ設定が変わる |
 | `dd` / `mkfs` / `/dev/` | ディスクやパーティションを直接操作する |
 | `>` で設定ファイルを上書き | 大事な設定が消える |
@@ -409,7 +407,6 @@ If a command contains any of these keywords and you don't fully understand it, *
 | Keyword to watch | Risk |
 |---|---|
 | Commands starting with `sudo` | Runs with admin privileges — affects entire system |
-| Commands containing `rm` | Deletes files/folders (may be unrecoverable) |
 | `chmod` / `chown` | Changes file permissions and security settings |
 | `dd` / `mkfs` / `/dev/` | Directly modifies disks and partitions |
 | `>` overwriting config files | Important settings may be erased |
@@ -445,7 +442,6 @@ vibe-local -y     # Auto-approve mode (advanced users only, at your own risk)
 | 需注意的关键词 | 风险 |
 |---|---|
 | 以 `sudo` 开头的命令 | 以管理员权限运行，影响整个系统 |
-| 包含 `rm` 的删除命令 | 文件/文件夹被删除（可能不可恢复） |
 | `chmod` / `chown` | 更改文件权限和安全设置 |
 | `dd` / `mkfs` / `/dev/` | 直接操作磁盘和分区 |
 | 用 `>` 覆盖配置文件 | 重要设置可能被清除 |
