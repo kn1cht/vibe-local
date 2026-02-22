@@ -579,12 +579,18 @@ if [ "$IS_MAC" -eq 1 ]; then
     fi
 fi
 
+# brew install は HOMEBREW_NO_AUTO_UPDATE=1 で高速化
+# (auto-update が走ると数分間フリーズしたように見える)
+brew_install() {
+    HOMEBREW_NO_AUTO_UPDATE=1 brew install "$@"
+}
+
 if command -v ollama &>/dev/null; then
     vapor_success "Ollama 🦙 $(msg installed) ($(ollama --version 2>/dev/null || echo '?'))"
 else
-    vaporwave_progress "Ollama $(msg installing)" 3
+    vapor_info "Ollama 🦙 $(msg installing)"
     if [ "$IS_MAC" -eq 1 ]; then
-        brew install ollama
+        brew_install ollama
     else
         curl -fsSL https://ollama.com/install.sh | sh
     fi
@@ -594,9 +600,9 @@ fi
 if command -v node &>/dev/null; then
     vapor_success "Node.js 💚 $(msg installed) ($(node --version))"
 else
-    vaporwave_progress "Node.js $(msg installing)" 3
+    vapor_info "Node.js 💚 $(msg installing)"
     if [ "$IS_MAC" -eq 1 ]; then
-        brew install node
+        brew_install node
     else
         if command -v apt-get &>/dev/null; then
             curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash -
@@ -614,7 +620,7 @@ fi
 if command -v claude &>/dev/null; then
     vapor_success "Claude Code CLI 🤖 $(msg installed)"
 else
-    vaporwave_progress "Claude Code CLI $(msg installing)" 5
+    vapor_info "Claude Code CLI 🤖 $(msg installing)"
     npm install -g @anthropic-ai/claude-code
     vapor_success "Claude Code CLI 🤖 $(msg install_done)"
 fi
@@ -622,9 +628,9 @@ fi
 if command -v python3 &>/dev/null; then
     vapor_success "Python3 🐍 $(msg installed) ($(python3 --version))"
 else
-    vaporwave_progress "Python3 $(msg installing)" 3
+    vapor_info "Python3 🐍 $(msg installing)"
     if [ "$IS_MAC" -eq 1 ]; then
-        brew install python3
+        brew_install python3
     else
         if command -v apt-get &>/dev/null; then
             sudo apt-get install -y python3
@@ -658,12 +664,18 @@ fi
 if curl -s "http://localhost:11434/api/tags" 2>/dev/null | grep -q "$MODEL"; then
     vapor_success "$MODEL $(msg model_downloaded) 🧠✨"
 else
-    echo -e "  ${PURPLE}┃${NC} 🔽 ${BOLD}${WHITE}$MODEL $(msg model_downloading)${NC}"
-    echo -e "  ${PURPLE}┃${NC}    ${DIM}($(msg model_download_hint))${NC}"
     echo ""
-    ollama pull "$MODEL"
+    echo -e "  ${PINK}💜${MAGENTA}💜${PURPLE}💜${CYAN}💜${AQUA}💜${MINT}💜${NEON_GREEN}💜${YELLOW}💜${ORANGE}💜${CORAL}💜${HOT_PINK}💜${NC}"
+    echo -e "  ${BOLD}${MAGENTA}  🔽  ${WHITE}$MODEL ${CYAN}$(msg model_downloading)${NC}"
+    echo -e "  ${DIM}${AQUA}      $(msg model_download_hint)${NC}"
+    echo -e "  ${PINK}💜${MAGENTA}💜${PURPLE}💜${CYAN}💜${AQUA}💜${MINT}💜${NEON_GREEN}💜${YELLOW}💜${ORANGE}💜${CORAL}💜${HOT_PINK}💜${NC}"
     echo ""
+    ollama pull "$MODEL" 2>/dev/null
+    echo ""
+    echo -e "  ${PINK}💜${MAGENTA}💜${PURPLE}💜${CYAN}💜${AQUA}💜${MINT}💜${NEON_GREEN}💜${YELLOW}💜${ORANGE}💜${CORAL}💜${HOT_PINK}💜${NC}"
     vapor_success "$MODEL $(msg model_dl_done) 🧠🎉"
+    echo -e "  ${PINK}💜${MAGENTA}💜${PURPLE}💜${CYAN}💜${AQUA}💜${MINT}💜${NEON_GREEN}💜${YELLOW}💜${ORANGE}💜${CORAL}💜${HOT_PINK}💜${NC}"
+    echo ""
 fi
 
 # =============================================
