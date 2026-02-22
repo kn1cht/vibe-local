@@ -61,7 +61,12 @@ def _resolve_model(requested_model, has_tools=False, message_count=0, max_tokens
     # Default: main model for everything else
     return MAIN_MODEL, False
 # [H3/L4 fix] Log to user-private directory with restricted permissions
-LOG_DIR = os.path.join(os.path.expanduser("~"), ".local", "state", "vibe-local", "proxy-debug")
+if os.name == "nt":
+    # Windows: use %LOCALAPPDATA%\vibe-local\proxy-debug
+    _appdata = os.environ.get("LOCALAPPDATA", os.path.join(os.path.expanduser("~"), "AppData", "Local"))
+    LOG_DIR = os.path.join(_appdata, "vibe-local", "proxy-debug")
+else:
+    LOG_DIR = os.path.join(os.path.expanduser("~"), ".local", "state", "vibe-local", "proxy-debug")
 os.makedirs(LOG_DIR, mode=0o700, exist_ok=True)
 
 # --- Debug mode ---
@@ -244,7 +249,10 @@ curl -X POST \\
   -H 'anthropic-version: 2023-06-01' \\
   -d @./{body_filename}
 """)
-        os.chmod(script_path, 0o755)
+        try:
+            os.chmod(script_path, 0o700)
+        except OSError:
+            pass  # Windows may not support Unix permissions
     except Exception as e:
         print(f"[proxy][debug] ERROR writing replay script: {e}", file=sys.stderr)
 
@@ -455,9 +463,20 @@ class AnthropicToOllamaHandler(http.server.BaseHTTPRequestHandler):
         else:
             self._respond(404, {"error": "not found"})
 
+    # Max request body size (50 MB) to prevent abuse
+    MAX_REQUEST_BYTES = 50 * 1024 * 1024
+
     def do_POST(self):
         path = self._parse_path()
-        content_length = int(self.headers.get("Content-Length", 0))
+        try:
+            content_length = int(self.headers.get("Content-Length", 0))
+        except (ValueError, TypeError):
+            content_length = 0
+        if content_length < 0:
+            content_length = 0
+        if content_length > self.MAX_REQUEST_BYTES:
+            self._respond(413, {"error": f"request too large: {content_length} bytes (max {self.MAX_REQUEST_BYTES})"})
+            return
         body = self.rfile.read(content_length)
         try:
             req = json.loads(body) if body else {}
@@ -615,14 +634,74 @@ class AnthropicToOllamaHandler(http.server.BaseHTTPRequestHandler):
             print(f"[proxy] >>> WEBSEARCH INTERCEPTED req#{req_id} <<<", file=sys.stderr)
             return self._handle_web_search(req, req_id, t_start)
 
-        requested_model = req.get("model", "qwen3-coder:30b")
+        # --- A1: Init probe fast-path ---
+        # Claude Code sends a probe with max_tokens=1, <=1 message, no tools to test connectivity.
+        # Respond instantly without hitting Ollama to save 2-5 seconds.
         messages = req.get("messages", [])
+        tools_list_raw = req.get("tools", [])
+        if (req.get("max_tokens", 4096) == 1
+                and len(messages) <= 1
+                and not tools_list_raw):
+            print(f"[proxy] >>> INIT PROBE FAST-PATH req#{req_id} <<<", file=sys.stderr)
+            _log("init_probe", {"req_id": req_id}, req_id=req_id)
+            stream = req.get("stream", False)
+            probe_model = req.get("model", "qwen3-coder:30b")
+            msg_id = f"msg_{uuid.uuid4().hex[:24]}"
+            if stream:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.end_headers()
+                self._send_sse("message_start", {
+                    "type": "message_start",
+                    "message": {
+                        "id": msg_id, "type": "message", "role": "assistant",
+                        "content": [], "model": probe_model,
+                        "stop_reason": None, "stop_sequence": None,
+                        "usage": {"input_tokens": 0, "output_tokens": 0,
+                                  "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0},
+                    },
+                })
+                self._send_sse("content_block_start", {
+                    "type": "content_block_start", "index": 0,
+                    "content_block": {"type": "text", "text": ""},
+                })
+                self._send_sse("content_block_delta", {
+                    "type": "content_block_delta", "index": 0,
+                    "delta": {"type": "text_delta", "text": ""},
+                })
+                self._send_sse("content_block_stop", {"type": "content_block_stop", "index": 0})
+                self._send_sse("message_delta", {
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                    "usage": {"output_tokens": 0},
+                })
+                self._send_sse("message_stop", {"type": "message_stop"})
+                self.wfile.flush()
+            else:
+                self._respond(200, {
+                    "id": msg_id, "type": "message", "role": "assistant",
+                    "content": [{"type": "text", "text": ""}],
+                    "model": probe_model,
+                    "stop_reason": "end_turn", "stop_sequence": None,
+                    "usage": {"input_tokens": 0, "output_tokens": 0,
+                              "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0},
+                })
+            elapsed_ms = int((time.time() - t_start) * 1000)
+            print(f"[proxy] Init probe responded in {elapsed_ms}ms", file=sys.stderr)
+            return
+
+        requested_model = req.get("model", "qwen3-coder:30b")
+        # messages and tools_list_raw already extracted above for init probe check
         system = req.get("system", "")
         max_tokens = min(req.get("max_tokens", 4096), MAX_TOKENS_CAP)
         temperature = req.get("temperature", 0.7)
+        stop_sequences = req.get("stop_sequences", None)
+        top_p = req.get("top_p", None)
+        top_k = req.get("top_k", None)
         stream = req.get("stream", False)
         original_stream = stream
-        tools_list = req.get("tools", [])
+        tools_list = tools_list_raw
 
         # Resolve model: route to appropriate local model
         model, is_sidecar = _resolve_model(
@@ -725,6 +804,14 @@ class AnthropicToOllamaHandler(http.server.BaseHTTPRequestHandler):
                         env_block += "- FORBIDDEN on macOS: apt, yum, dmesg, lsusb, lshw, lspci, /proc/, /home/\n"
                     elif "linux" in platform:
                         env_block += "- This is Linux. Home directory: /home/\n"
+                    elif "win" in platform or "windows" in env_info.get("os_version", "").lower():
+                        env_block += "\nIMPORTANT — This is Windows (NOT Linux/macOS):\n"
+                        env_block += "- Home directory: %USERPROFILE% (e.g. C:\\Users\\username)\n"
+                        env_block += "- Package manager: winget (NEVER apt, brew, yum)\n"
+                        env_block += "- Shell: PowerShell or cmd.exe\n"
+                        env_block += "- Use: Get-ChildItem (dir), Get-Content (type), Remove-Item (del)\n"
+                        env_block += "- Paths use backslash: C:\\Users\\... (NEVER /home/)\n"
+                        env_block += "- FORBIDDEN on Windows: apt, brew, /home/, /proc/, chmod\n"
                     sys_text += env_block
 
                 if user_instructions:
@@ -771,6 +858,25 @@ class AnthropicToOllamaHandler(http.server.BaseHTTPRequestHandler):
                         btype = block.get("type", "")
                         if btype == "text":
                             text_parts.append(block.get("text", ""))
+                        elif btype == "image":
+                            # A6: Convert Anthropic image format to OpenAI image_url data URI
+                            source = block.get("source", {})
+                            src_type = source.get("type", "")
+                            if src_type == "base64":
+                                media_type = source.get("media_type", "image/png")
+                                data = source.get("data", "")
+                                if data:
+                                    text_parts.append({
+                                        "type": "image_url",
+                                        "image_url": {"url": f"data:{media_type};base64,{data}"},
+                                    })
+                            elif src_type == "url":
+                                url = source.get("url", "")
+                                if url:
+                                    text_parts.append({
+                                        "type": "image_url",
+                                        "image_url": {"url": url},
+                                    })
                         elif btype == "thinking":
                             pass
                         elif btype == "tool_use":
@@ -803,13 +909,26 @@ class AnthropicToOllamaHandler(http.server.BaseHTTPRequestHandler):
                     continue
 
                 if tool_calls_out:
-                    assistant_msg = {"role": "assistant", "content": "\n".join(text_parts) if text_parts else None}
+                    text_only = [p for p in text_parts if isinstance(p, str)]
+                    assistant_msg = {"role": "assistant", "content": "\n".join(text_only) if text_only else None}
                     assistant_msg["tool_calls"] = tool_calls_out
                     oai_messages.append(assistant_msg)
                     continue
 
-                content = "\n".join(text_parts)
-                oai_messages.append({"role": role, "content": content})
+                # A6: If any part is a dict (image), use OpenAI multimodal content array
+                has_images = any(isinstance(p, dict) for p in text_parts)
+                if has_images:
+                    oai_content = []
+                    for p in text_parts:
+                        if isinstance(p, str):
+                            if p:
+                                oai_content.append({"type": "text", "text": p})
+                        else:
+                            oai_content.append(p)  # already in OpenAI format
+                    oai_messages.append({"role": role, "content": oai_content})
+                else:
+                    content = "\n".join(text_parts)
+                    oai_messages.append({"role": role, "content": content})
             else:
                 oai_messages.append({"role": role, "content": content})
 
@@ -836,7 +955,30 @@ class AnthropicToOllamaHandler(http.server.BaseHTTPRequestHandler):
                     })
             if oai_tools:
                 oai_req["tools"] = oai_tools
-                oai_req["tool_choice"] = "auto"
+                # A2: Convert Anthropic tool_choice format to OpenAI format
+                tc = req.get("tool_choice")
+                if isinstance(tc, dict):
+                    tc_type = tc.get("type", "auto")
+                    if tc_type == "any":
+                        oai_req["tool_choice"] = "required"
+                    elif tc_type == "none":
+                        oai_req["tool_choice"] = "none"
+                    elif tc_type == "tool":
+                        oai_req["tool_choice"] = {"type": "function", "function": {"name": tc.get("name", "")}}
+                    else:
+                        oai_req["tool_choice"] = "auto"
+                else:
+                    oai_req["tool_choice"] = "auto"
+
+        # A3: Forward stop_sequences as "stop"
+        if stop_sequences:
+            oai_req["stop"] = stop_sequences
+
+        # A4: Forward top_p and top_k
+        if top_p is not None:
+            oai_req["top_p"] = top_p
+        if top_k is not None:
+            oai_req["top_k"] = top_k
 
         _log("req_to_ollama", {
             "model": oai_req.get("model"),
@@ -1215,24 +1357,51 @@ class AnthropicToOllamaHandler(http.server.BaseHTTPRequestHandler):
         _debug_summary(req_id, model, msg_count, "stream", elapsed_ms, True, "end_turn")
 
     def _handle_count_tokens(self, req):
+        # Collect all text for tokenization
+        all_text = []
         messages = req.get("messages", [])
-        total = 0
         for msg in messages:
             content = msg.get("content", "")
             if isinstance(content, list):
                 for block in content:
                     if isinstance(block, dict) and block.get("type") == "text":
-                        total += len(block.get("text", "")) // 4
+                        all_text.append(block.get("text", ""))
             else:
-                total += len(str(content)) // 4
+                all_text.append(str(content))
         system = req.get("system", "")
         if system:
             if isinstance(system, list):
                 for block in system:
                     if isinstance(block, dict):
-                        total += len(block.get("text", "")) // 4
+                        all_text.append(block.get("text", ""))
             else:
-                total += len(str(system)) // 4
+                all_text.append(str(system))
+
+        combined = "\n".join(all_text)
+
+        # A5: Try Ollama /api/tokenize for accurate count, fallback to len//4
+        total = None
+        try:
+            tok_body = json.dumps({"model": MAIN_MODEL, "text": combined}).encode("utf-8")
+            tok_req = urllib.request.Request(
+                f"{OLLAMA_BASE}/api/tokenize",
+                data=tok_body,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            tok_resp = urllib.request.urlopen(tok_req, timeout=5)
+            tok_data = json.loads(tok_resp.read())
+            tokens = tok_data.get("tokens", None)
+            if tokens is not None:
+                total = len(tokens)
+                print(f"[proxy] Token count via Ollama tokenize: {total}")
+        except Exception:
+            pass  # Ollama may not support /api/tokenize
+
+        if total is None:
+            total = len(combined) // 4
+            print(f"[proxy] Token count via len//4 fallback: {total}")
+
         self._respond(200, {"input_tokens": total})
 
     def _send_sse(self, event_type, data):

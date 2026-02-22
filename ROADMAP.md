@@ -3,17 +3,25 @@
 > Last updated: 2026-02-22
 > Based on debug sessions: session_20260222_160817 (94 req), session_20260222_164340 (11 req), session_20260222_164837 (47 req)
 
-## Current State (v0.1)
+## Current State (v0.2)
 
 Working:
 - Dual-model routing (qwen3-coder:30b + qwen3:8b sidecar)
 - macOS environment injection (brew, /Users/, system_profiler)
+- Windows environment injection (winget, %USERPROFILE%, PowerShell)
 - Proxy auto-restart on code update (mtime detection)
 - Tool filtering (20 → 9 essential tools)
 - XML tool call fallback
 - Zero crashes, zero errors in proxy
 - Speed test via curl example works
 - HTML preferred over pygame for GUI
+- **Windows support** (install.ps1, vibe-local.ps1, vibe-local.cmd)
+- **Init probe fast-path** (instant response for connectivity checks)
+- **tool_choice forwarding** (Anthropic→OpenAI format conversion)
+- **stop_sequences / top_p / top_k forwarding**
+- **Image/Vision support** (Anthropic base64→OpenAI data URI)
+- **Ollama tokenize** for accurate token counting
+- **Security**: replay scripts 0o700, 50MB request size limit
 
 ## P0 — Critical (Breaks User Experience)
 
@@ -87,9 +95,9 @@ Working:
 ## P2 — Medium (System/Proxy Improvements)
 
 ### P2-1: Sidecar cold start (18.5s)
-**Status**: TODO
+**Status**: MITIGATED (init probe fast-path bypasses Ollama entirely for probe requests)
 **Impact**: First sidecar request takes 18s while model loads into VRAM
-**Fix**: Send warmup request to both models on proxy startup. Estimated code: 15 lines.
+**Fix**: Init probe fast-path added (A1). Warmup thread already exists in proxy startup.
 
 ### P2-2: Proxy log overwrite
 **Status**: TODO
@@ -133,6 +141,28 @@ Working:
 **Status**: TODO
 **Impact**: ~189 files in root proxy-debug/ from before session dirs
 **Fix**: One-time cleanup script
+
+## Windows Support (v0.2)
+
+**Status**: DONE
+- `install.ps1` / `install.cmd`: Windows installer with winget-based dependency installation
+- `vibe-local.ps1` / `vibe-local.cmd`: Windows launcher (PowerShell + CMD wrapper)
+- Proxy cross-platform fixes: Windows log paths, chmod tolerance, Windows OS hints
+- `install.sh` detects MINGW/MSYS/CYGWIN and redirects to PowerShell installer
+- `.gitattributes` for correct line endings (LF for .py/.sh, CRLF for .ps1/.cmd)
+
+## Proxy Improvements (v0.2)
+
+| ID | Feature | Status |
+|----|---------|--------|
+| A1 | Init probe fast-path | DONE |
+| A2 | tool_choice forwarding | DONE |
+| A3 | stop_sequences forwarding | DONE |
+| A4 | top_p / top_k forwarding | DONE |
+| A5 | Token count via Ollama tokenize | DONE |
+| A6 | Image/Vision support | DONE |
+| A7 | Windows cross-platform | DONE |
+| A8 | Security (0o700, 50MB limit) | DONE |
 
 ## Metrics to Track
 

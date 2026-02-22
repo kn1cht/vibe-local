@@ -13,6 +13,21 @@
 # 各ステップで個別にエラーハンドリングする
 set -uo pipefail
 
+# --- Windows detection: redirect to PowerShell installer ---
+case "$(uname -s 2>/dev/null)" in
+    MINGW*|MSYS*|CYGWIN*)
+        echo "Windows detected (Git Bash / MSYS2). Launching PowerShell installer..."
+        SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || echo ".")"
+        if [ -f "${SCRIPT_DIR}/install.ps1" ]; then
+            powershell.exe -ExecutionPolicy Bypass -File "${SCRIPT_DIR}/install.ps1" "$@"
+        else
+            echo "Error: install.ps1 not found. Download from:"
+            echo "  https://github.com/ochyai/vibe-local"
+        fi
+        exit $?
+        ;;
+esac
+
 # ╔══════════════════════════════════════════════════════════════╗
 # ║  🎨  Ｖ Ａ Ｐ Ｏ Ｒ Ｗ Ａ Ｖ Ｅ   Ｃ Ｏ Ｌ Ｏ Ｒ Ｓ    ║
 # ╚══════════════════════════════════════════════════════════════╝

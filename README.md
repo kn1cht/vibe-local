@@ -33,17 +33,23 @@
 
 ### これは何？
 
-MacにコマンドをコピペするだけでAIがコードを書いてくれる環境。
+MacやWindows、LinuxにコマンドをコピペするだけでAIがコードを書いてくれる環境。
 ネットワーク不要・完全無料。Ollama + ローカルLLM で Claude Code のインターフェースをそのまま使える。
 
 ### インストール (3ステップ)
 
-**1.** ターミナルを開く（Spotlight `Cmd+Space` → "ターミナル"で検索）
+**1.** ターミナルを開く（Mac: Spotlight `Cmd+Space` → "ターミナル"で検索 / Windows: PowerShellを開く）
 
 **2.** 以下をコピペしてEnter:
 
+*Mac / Linux / Windows(WSL) の場合:*
 ```bash
 curl -fsSL https://raw.githubusercontent.com/ochyai/vibe-local/main/install.sh | bash
+```
+
+*Windows (PowerShell) の場合:*
+```powershell
+Invoke-WebRequest -Uri https://raw.githubusercontent.com/ochyai/vibe-local/main/install.ps1 -UseBasicParsing | Invoke-Expression
 ```
 
 **3.** 新しいターミナルを開いて起動:
@@ -76,6 +82,8 @@ vibe-local --model qwen3:8b
 | Apple Silicon Mac (M1以降) | 16GB | qwen3:8b | qwen3:1.7b | ⭐ 十分実用的 |
 | Apple Silicon Mac (M1以降) | 8GB | qwen3:1.7b | なし | 最低限動作 |
 | Intel Mac | 16GB+ | qwen3:8b | qwen3:1.7b | 動作するが遅め |
+| Windows (ネイティブ) | 16GB+ | qwen3:8b | qwen3:1.7b | NVIDIA GPU推奨 |
+| Windows (WSL2) | 16GB+ | qwen3:8b | qwen3:1.7b | NVIDIA GPU推奨 |
 | Linux (x86_64/arm64) | 16GB+ | qwen3:8b | qwen3:1.7b | NVIDIA GPU推奨 |
 
 > サイドカーモデル = 権限チェックや初期化プローブなど軽量タスク用。自動選択されます。
@@ -88,7 +96,7 @@ vibe-local --model qwen3:8b
 **"ollama が起動できませんでした"**
 ```bash
 open -a Ollama        # macOS
-ollama serve          # Linux
+ollama serve          # Linux / Windows
 ```
 
 **"モデルが見つかりません"**
@@ -122,17 +130,23 @@ VIBE_LOCAL_DEBUG=1 vibe-local
 
 ### これは なに？
 
-Mac（まっく）で、AI（えーあい）が コードを かいて くれる どうぐ です。
+Mac（まっく）や Windows（ういんどうず）で、AI（えーあい）が コードを かいて くれる どうぐ です。
 インターネットが なくても つかえます。おかねも かかりません。
 
 ### いれかた（3つの ステップ）
 
-**1.** ターミナルを ひらく（`Cmd+Space` → 「ターミナル」で けんさく）
+**1.** ターミナルを ひらく（Mac: `Cmd+Space` → 「ターミナル」 / Windows: PowerShellを ひらく）
 
 **2.** したの もじを コピーして、はりつけて、Enterを おす：
 
+*Mac / Linux / Windows(WSL) のとき:*
 ```bash
 curl -fsSL https://raw.githubusercontent.com/ochyai/vibe-local/main/install.sh | bash
+```
+
+*Windows (PowerShell) のとき:*
+```powershell
+Invoke-WebRequest -Uri https://raw.githubusercontent.com/ochyai/vibe-local/main/install.ps1 -UseBasicParsing | Invoke-Expression
 ```
 
 **3.** あたらしい ターミナルを ひらいて、これを うつ：
@@ -179,17 +193,23 @@ AIは かんぺきでは ありません。まちがった コマンドを う�
 
 ### What is this?
 
-A free AI coding environment you can set up with a single command on your Mac.
+A free AI coding environment you can set up with a single command on your Mac, Windows, or Linux.
 No network required. Completely free. Uses Ollama + local LLM with the Claude Code interface.
 
 ### Install (3 steps)
 
-**1.** Open Terminal (Spotlight `Cmd+Space` → search "Terminal")
+**1.** Open Terminal (Mac: Spotlight `Cmd+Space` → search "Terminal" / Windows: Open PowerShell)
 
 **2.** Paste and hit Enter:
 
+*For Mac / Linux / Windows(WSL):*
 ```bash
 curl -fsSL https://raw.githubusercontent.com/ochyai/vibe-local/main/install.sh | bash
+```
+
+*For Windows (PowerShell natively):*
+```powershell
+Invoke-WebRequest -Uri https://raw.githubusercontent.com/ochyai/vibe-local/main/install.ps1 -UseBasicParsing | Invoke-Expression
 ```
 
 **3.** Open a new terminal and run:
@@ -222,6 +242,8 @@ vibe-local --model qwen3:8b
 | Apple Silicon Mac (M1+) | 16GB | qwen3:8b | qwen3:1.7b | ⭐ Very capable |
 | Apple Silicon Mac (M1+) | 8GB | qwen3:1.7b | none | Minimum viable |
 | Intel Mac | 16GB+ | qwen3:8b | qwen3:1.7b | Works but slower |
+| Windows (Native) | 16GB+ | qwen3:8b | qwen3:1.7b | NVIDIA GPU recommended |
+| Windows (WSL2) | 16GB+ | qwen3:8b | qwen3:1.7b | NVIDIA GPU recommended |
 | Linux (x86_64/arm64) | 16GB+ | qwen3:8b | qwen3:1.7b | NVIDIA GPU recommended |
 
 > Sidecar model = auto-selected lighter model for permission checks, init probes, and short summaries.
@@ -234,7 +256,7 @@ vibe-local --model qwen3:8b
 **"ollama failed to start"**
 ```bash
 open -a Ollama        # macOS
-ollama serve          # Linux
+ollama serve          # Linux / Windows
 ```
 
 **"model not found"**
@@ -268,17 +290,23 @@ VIBE_LOCAL_DEBUG=1 vibe-local
 
 ### 这是什么？
 
-在Mac上只需复制粘贴一个命令，AI就能帮你写代码。
+在Mac、Windows 或 Linux上只需复制粘贴一个命令，AI就能帮你写代码。
 无需网络，完全免费。使用 Ollama + 本地大语言模型，享受 Claude Code 的界面体验。
 
 ### 安装（3步）
 
-**1.** 打开终端（Spotlight `Cmd+Space` → 搜索"终端"或"Terminal"）
+**1.** 打开终端（Mac: Spotlight `Cmd+Space` → 搜索"终端" / Windows: 打开 PowerShell）
 
 **2.** 粘贴以下命令并按回车：
 
+*Mac / Linux / Windows(WSL) 环境:*
 ```bash
 curl -fsSL https://raw.githubusercontent.com/ochyai/vibe-local/main/install.sh | bash
+```
+
+*Windows (PowerShell) 环境:*
+```powershell
+Invoke-WebRequest -Uri https://raw.githubusercontent.com/ochyai/vibe-local/main/install.ps1 -UseBasicParsing | Invoke-Expression
 ```
 
 **3.** 打开新终端并运行：
@@ -311,6 +339,8 @@ vibe-local --model qwen3:8b
 | Apple Silicon Mac (M1及以上) | 16GB | qwen3:8b | qwen3:1.7b | ⭐ 足够实用 |
 | Apple Silicon Mac (M1及以上) | 8GB | qwen3:1.7b | 无 | 最低限运行 |
 | Intel Mac | 16GB+ | qwen3:8b | qwen3:1.7b | 可运行但较慢 |
+| Windows (原生) | 16GB+ | qwen3:8b | qwen3:1.7b | 推荐NVIDIA GPU |
+| Windows (WSL2) | 16GB+ | qwen3:8b | qwen3:1.7b | 推荐NVIDIA GPU |
 | Linux (x86_64/arm64) | 16GB+ | qwen3:8b | qwen3:1.7b | 推荐NVIDIA GPU |
 
 > 边车模型 = 用于权限检查、初始化探测等轻量任务的自动选择的较小模型。
@@ -323,7 +353,7 @@ vibe-local --model qwen3:8b
 **"ollama 无法启动"**
 ```bash
 open -a Ollama        # macOS
-ollama serve          # Linux
+ollama serve          # Linux / Windows
 ```
 
 **"未找到模型"**
@@ -358,7 +388,7 @@ VIBE_LOCAL_DEBUG=1 vibe-local
 ```
 ┌─────────────────────────────────────────────────────────┐
 │  User                                                   │
-│  └─> vibe-local.sh (launch script)                      │
+│  └─> vibe-local.sh / vibe-local.ps1 (launch script)     │
 │       ├─ Ensure Ollama is running                       │
 │       ├─ Start anthropic-ollama-proxy.py                │
 │       ├─ Set ANTHROPIC_BASE_URL → proxy                 │
@@ -559,7 +589,7 @@ vibe-local は**大学の授業やワークショップ**で、AIエージェン
 #### 事前準備（講師向け）
 
 ```bash
-# 1. 会場のMacに事前インストール（ネットワーク接続時）
+# 1. 会場のMac/PCに事前インストール（ネットワーク接続時）
 curl -fsSL https://raw.githubusercontent.com/ochyai/vibe-local/main/install.sh | bash
 
 # 2. モデルを事前ダウンロード（オフライン対応）
@@ -593,7 +623,7 @@ vibe-local is designed for **university classes and workshops** where participan
 #### Pre-setup (Instructor)
 
 ```bash
-# 1. Pre-install on venue Macs (while online)
+# 1. Pre-install on venue computers (while online)
 curl -fsSL https://raw.githubusercontent.com/ochyai/vibe-local/main/install.sh | bash
 
 # 2. Pre-download models (for offline use)
@@ -626,12 +656,12 @@ vibe-local はオフライン環境に特化しています。以下が**オフ�
 |------|:--------:|------|
 | コード生成・実行 | ✅ | 全てローカルで処理 |
 | ファイル操作 (読み書き・編集) | ✅ | |
-| ターミナルコマンド実行 | ✅ | |
+| コマンド実行 | ✅ | |
 | Git操作 (ローカル) | ✅ | push/pullはオンライン必要 |
 | HTMLアプリ作成・表示 | ✅ | ブラウザで開くだけ |
-| Web検索 (WebSearch) | ❌ | オフラインでは利用不可 |
-| URLフェッチ (WebFetch) | ❌ | オフラインでは利用不可 |
-| パッケージインストール (pip/brew) | ❌ | オフラインでは利用不可 |
+| Web検索 (WebSearch) | △ | オンラインなら DuckDuckGo 経由で動作 |
+| URLフェッチ (WebFetch) | △ | オンラインなら動作 |
+| パッケージインストール (pip/brew/winget) | △ | オンラインなら動作 |
 
 #### オフラインでの調べもの
 
@@ -651,9 +681,9 @@ vibe-local is optimized for offline environments:
 | Terminal command execution | ✅ | |
 | Git operations (local) | ✅ | push/pull need network |
 | HTML app creation & viewing | ✅ | Just opens in browser |
-| Web search (WebSearch) | ❌ | Not available offline |
-| URL fetch (WebFetch) | ❌ | Not available offline |
-| Package install (pip/brew) | ❌ | Not available offline |
+| Web search (WebSearch) | △ | Works online via DuckDuckGo |
+| URL fetch (WebFetch) | △ | Works online |
+| Package install (pip/brew/winget) | △ | Works online |
 
 ---
 
@@ -708,7 +738,7 @@ vibe-local is optimized for offline environments:
 - Local LLM accuracy is lower than Claude API
 - First model download takes time (several GB to 20GB)
 - Use `vibe-local --auto` to auto-switch to Claude API when online
-- WebSearch/WebFetch tools require network — they do not work offline
+- WebSearch/WebFetch tools require network (△ online only — WebSearch uses DuckDuckGo via proxy)
 - Large installs (MacTeX ~4GB, Xcode tools) take significant time
 
 ---
