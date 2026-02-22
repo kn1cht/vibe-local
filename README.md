@@ -148,14 +148,14 @@ vibe-local -p "Pythonで じゃんけんゲームを つくって"
 
 AIは かんぺきでは ありません。まちがった コマンドを うつことが あります。
 
-**ぜったいに やっては いけない こと：**
+**きけんな サイン — こんな コマンドは ゆるさないで！**
 
-| あぶない コマンド | なにが おきる |
+| きけんな キーワード | なぜ あぶない？ |
 |---|---|
-| `rm -rf /` や `rm -rf ~` | パソコンの ファイルが ぜんぶ きえる |
-| `sudo` で はじまる コマンド | パソコンの だいじな せっていが かわる |
-| `chmod 777` | ファイルの セキュリティが なくなる |
-| `curl ... \| bash` | しらない プログラムが うごく |
+| `rm` が はいっている | ファイルが きえる かもしれない |
+| `sudo` で はじまる | パソコンの だいじな せっていが かわる |
+| `chmod` が はいっている | ファイルの まもりが なくなる |
+| いみが わからない ながい コマンド | なにが おきるか わからない！ |
 
 **あんぜんに つかう ほうほう：**
 
@@ -354,19 +354,19 @@ qwen3-coder:30b (AI model)
 
 **ローカルLLMはクラウドAIより精度が低いため、意図しない危険な操作を実行するリスクがあります。**
 
-#### 絶対にやってはいけないこと
+#### こんなコマンドに注意
 
-AIが以下のようなコマンドを提案・実行しようとした場合は、**必ず拒否してください：**
+AIが提案するコマンドの中に以下のキーワードが含まれていたら、**内容を理解できない限り拒否してください：**
 
-| 危険なコマンド | 何が起きるか |
+| 注意すべきキーワード | リスク |
 |---|---|
-| `rm -rf /` や `rm -rf ~/*` | ファイルが全削除される（復旧不可能） |
-| `sudo rm` / `sudo chmod` / `sudo chown` | システムファイルが破壊される |
-| `chmod 777` / `chmod -R 777` | セキュリティが無効化される |
-| `curl ... \| sudo bash` | 未知のスクリプトが管理者権限で実行される |
-| `dd if=... of=/dev/...` | ディスクが上書きされる |
-| `> /etc/...` や `> ~/.zshrc` | 設定ファイルが空になる |
-| `git push --force` | 他の人の作業が消える |
+| `sudo` で始まるコマンド | システム全体に影響する管理者権限での操作 |
+| `rm` を含む削除系コマンド | ファイルやフォルダが消える（元に戻せないことも） |
+| `chmod` / `chown` | ファイルの権限やセキュリティ設定が変わる |
+| `dd` / `mkfs` / `/dev/` | ディスクやパーティションを直接操作する |
+| `>` で設定ファイルを上書き | 大事な設定が消える |
+| `--force` が付いたコマンド | 安全確認をスキップして強制実行する |
+| 意味がわからない長いコマンド | 何が起きるかわからない＝許可してはいけない |
 
 #### 安全に使うためのルール
 
@@ -402,19 +402,19 @@ In auto-approve mode, the AI can read/write files, execute commands, and modify 
 
 **Local LLMs are less accurate than cloud AI — they may attempt dangerous operations unintentionally.**
 
-#### Commands you should NEVER allow
+#### Watch for these keywords in commands
 
-If the AI suggests or tries to run any of these, **always reject:**
+If a command contains any of these keywords and you don't fully understand it, **always reject:**
 
-| Dangerous command | What happens |
+| Keyword to watch | Risk |
 |---|---|
-| `rm -rf /` or `rm -rf ~/*` | All files deleted (unrecoverable) |
-| `sudo rm` / `sudo chmod` / `sudo chown` | System files destroyed |
-| `chmod 777` / `chmod -R 777` | Security disabled on files |
-| `curl ... \| sudo bash` | Unknown script runs as admin |
-| `dd if=... of=/dev/...` | Disk overwritten |
-| `> /etc/...` or `> ~/.zshrc` | Config files emptied |
-| `git push --force` | Other people's work erased |
+| Commands starting with `sudo` | Runs with admin privileges — affects entire system |
+| Commands containing `rm` | Deletes files/folders (may be unrecoverable) |
+| `chmod` / `chown` | Changes file permissions and security settings |
+| `dd` / `mkfs` / `/dev/` | Directly modifies disks and partitions |
+| `>` overwriting config files | Important settings may be erased |
+| `--force` flag | Skips safety checks and forces execution |
+| Long commands you don't understand | If you can't read it, don't allow it |
 
 #### Rules for safe usage
 
@@ -438,19 +438,19 @@ vibe-local -y     # Auto-approve mode (advanced users only, at your own risk)
 
 **本地LLM的精度低于云端AI，可能意外执行危险操作。**
 
-#### 绝对不能允许的命令
+#### 注意以下关键词
 
-如果AI建议或尝试运行以下命令，**务必拒绝：**
+如果命令中包含以下关键词且你不完全理解其含义，**务必拒绝：**
 
-| 危险命令 | 后果 |
+| 需注意的关键词 | 风险 |
 |---|---|
-| `rm -rf /` 或 `rm -rf ~/*` | 所有文件被删除（不可恢复） |
-| `sudo rm` / `sudo chmod` / `sudo chown` | 系统文件被破坏 |
-| `chmod 777` / `chmod -R 777` | 文件安全性被解除 |
-| `curl ... \| sudo bash` | 未知脚本以管理员权限运行 |
-| `dd if=... of=/dev/...` | 磁盘被覆盖 |
-| `> /etc/...` 或 `> ~/.zshrc` | 配置文件被清空 |
-| `git push --force` | 他人的工作被覆盖 |
+| 以 `sudo` 开头的命令 | 以管理员权限运行，影响整个系统 |
+| 包含 `rm` 的删除命令 | 文件/文件夹被删除（可能不可恢复） |
+| `chmod` / `chown` | 更改文件权限和安全设置 |
+| `dd` / `mkfs` / `/dev/` | 直接操作磁盘和分区 |
+| 用 `>` 覆盖配置文件 | 重要设置可能被清除 |
+| 带 `--force` 的命令 | 跳过安全检查强制执行 |
+| 看不懂的长命令 | 看不懂 = 不能允许 |
 
 #### 安全使用规则
 
