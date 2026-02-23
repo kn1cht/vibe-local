@@ -4859,7 +4859,7 @@ class TestTokenUsageDisplay:
 
     def test_version_bump(self):
         """Verify version was bumped for this feature release."""
-        assert vc.__version__ == "0.9.4"
+        assert vc.__version__ == "0.9.5"
 
     def test_bash_tool_has_run_in_background_param(self):
         tool = vc.BashTool()
