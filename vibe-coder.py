@@ -6953,10 +6953,9 @@ def _exit_plan_mode(agent, session):
         return
     plan_content = _read_latest_plan(agent)
     agent._plan_mode = False
-    # Git checkpoint before entering Act mode
-    if agent.git_checkpoint._is_git_repo:
-        if agent.git_checkpoint.create("plan-to-act"):
-            print(f"  {_ansi(chr(27) + '[38;5;87m')}Git checkpoint saved (use /rollback to undo){C.RESET}")
+    # Note: intentionally NOT creating git checkpoint here.
+    # GitCheckpoint.create() uses `git stash push -u` which removes working tree
+    # changes — that would destroy the user's work on mode toggle.
     # Inject plan into session context
     if plan_content:
         session.add_system_note(
