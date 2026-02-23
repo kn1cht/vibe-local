@@ -53,7 +53,7 @@ curl -fsSL https://raw.githubusercontent.com/ochyai/vibe-local/main/install.sh |
 
 *Windows (PowerShell) の場合:*
 ```powershell
-Invoke-WebRequest -Uri https://raw.githubusercontent.com/ochyai/vibe-local/main/install.ps1 -UseBasicParsing | Invoke-Expression
+Invoke-Expression (Invoke-RestMethod -Uri https://raw.githubusercontent.com/ochyai/vibe-local/main/install.ps1)
 ```
 
 **3.** 新しいターミナルを開いて起動:
@@ -147,7 +147,7 @@ curl -fsSL https://raw.githubusercontent.com/ochyai/vibe-local/main/install.sh |
 
 *Windows (PowerShell) のとき:*
 ```powershell
-Invoke-WebRequest -Uri https://raw.githubusercontent.com/ochyai/vibe-local/main/install.ps1 -UseBasicParsing | Invoke-Expression
+Invoke-Expression (Invoke-RestMethod -Uri https://raw.githubusercontent.com/ochyai/vibe-local/main/install.ps1)
 ```
 
 **3.** あたらしい ターミナルを ひらいて、これを うつ：
@@ -231,7 +231,7 @@ curl -fsSL https://raw.githubusercontent.com/ochyai/vibe-local/main/install.sh |
 
 *For Windows (PowerShell natively):*
 ```powershell
-Invoke-WebRequest -Uri https://raw.githubusercontent.com/ochyai/vibe-local/main/install.ps1 -UseBasicParsing | Invoke-Expression
+Invoke-Expression (Invoke-RestMethod -Uri https://raw.githubusercontent.com/ochyai/vibe-local/main/install.ps1)
 ```
 
 **3.** Open a new terminal and run:
@@ -331,7 +331,7 @@ curl -fsSL https://raw.githubusercontent.com/ochyai/vibe-local/main/install.sh |
 
 *Windows (PowerShell) 环境:*
 ```powershell
-Invoke-WebRequest -Uri https://raw.githubusercontent.com/ochyai/vibe-local/main/install.ps1 -UseBasicParsing | Invoke-Expression
+Invoke-Expression (Invoke-RestMethod -Uri https://raw.githubusercontent.com/ochyai/vibe-local/main/install.ps1)
 ```
 
 **3.** 打开新终端并运行：
