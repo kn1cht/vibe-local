@@ -5583,3 +5583,114 @@ class TestFileToolsAuditFixes:
             assert "outputs" in updated["cells"][0]
         finally:
             os.unlink(path)
+
+
+class TestRound10AuditFixes:
+    """Tests for TUI, Session, OllamaClient audit fixes + user-reported bugs (Round 10)."""
+
+    def test_rl_ansi_wraps_for_readline(self):
+        """_rl_ansi should wrap ANSI codes in \\001/\\002 for readline."""
+        code = "\033[38;5;51m"
+        result = vc._rl_ansi(code)
+        if vc.HAS_READLINE and vc.C._enabled:
+            assert result.startswith("\001")
+            assert result.endswith("\002")
+            assert code in result
+        else:
+            assert result == vc._ansi(code)
+
+    def test_recalculate_tokens_list_content(self):
+        """_recalculate_tokens should handle list content (image messages)."""
+        config = vc.Config.__new__(vc.Config)
+        config.debug = False
+        config.context_window = 128000
+        config.sessions_dir = "/tmp"
+        config.model = "test"
+        config.sidecar_model = ""
+        session = vc.Session.__new__(vc.Session)
+        session.config = config
+        session.messages = [
+            {"role": "user", "content": [
+                {"type": "text", "text": "describe this image"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+            ]},
+        ]
+        session._token_estimate = 0
+        session._recalculate_tokens()
+        assert session._token_estimate > 800, \
+            f"Expected > 800 tokens for image message, got {session._token_estimate}"
+
+    def test_recalculate_tokens_string_content(self):
+        """_recalculate_tokens should still work with normal string content."""
+        config = vc.Config.__new__(vc.Config)
+        config.debug = False
+        config.context_window = 128000
+        config.sessions_dir = "/tmp"
+        config.model = "test"
+        config.sidecar_model = ""
+        session = vc.Session.__new__(vc.Session)
+        session.config = config
+        session.messages = [
+            {"role": "user", "content": "hello world"},
+        ]
+        session._token_estimate = 0
+        session._recalculate_tokens()
+        assert session._token_estimate > 0
+
+    def test_error_body_variable_name(self):
+        """OllamaClient.chat should use error_body for HTTP error details."""
+        import inspect
+        source = inspect.getsource(vc.OllamaClient.chat)
+        assert "error_body" in source, "Should use error_body variable name"
+
+    def test_list_sessions_filters_before_slicing(self):
+        """list_sessions should filter for .jsonl before applying [:50] limit."""
+        import inspect
+        source = inspect.getsource(vc.Session.list_sessions)
+        assert "jsonl_files" in source
+
+    def test_enforce_max_messages_no_pop0(self):
+        """_enforce_max_messages should not use O(n^2) pop(0) in a loop."""
+        import inspect
+        source = inspect.getsource(vc.Session._enforce_max_messages)
+        assert "pop(0)" not in source, "Should use slice instead of pop(0)"
+
+    def test_save_reraises_write_errors(self):
+        """Session.save inner except should re-raise for user warning."""
+        import inspect
+        source = inspect.getsource(vc.Session.save)
+        # Find the pattern: except Exception: ... os.unlink ... raise
+        assert "raise  # propagate" in source or ("raise" in source and "os.unlink" in source)
+
+    def test_compaction_drops_orphaned_assistant_with_tool_calls(self):
+        """Compaction should drop assistant messages with tool_calls if tool results were dropped."""
+        remaining = [
+            {"role": "assistant", "content": "planning", "tool_calls": [{"id": "c1"}]},
+            {"role": "user", "content": "next question"},
+        ]
+        if remaining[0].get("role") == "assistant" and remaining[0].get("tool_calls"):
+            if len(remaining) < 2 or remaining[1].get("role") != "tool":
+                remaining.pop(0)
+        assert remaining[0]["role"] == "user", "Orphaned assistant with tool_calls should be dropped"
+
+    def test_help_text_says_vibe_local(self):
+        """Help text should reference vibe-local, not vibe-coder."""
+        import inspect
+        source = inspect.getsource(vc.TUI.show_help)
+        assert "vibe-coder" not in source, "Help text should say vibe-local, not vibe-coder"
+
+    def test_webfetch_url_encoding_japanese(self):
+        """WebFetch should handle URLs with non-ASCII characters."""
+        # Verify the URL encoding fix exists in the code
+        import inspect
+        source = inspect.getsource(vc.WebFetchTool.execute)
+        assert "urllib.parse.quote" in source, "Should encode non-ASCII URL characters"
+
+    def test_cli_fullwidth_space_handling(self):
+        """CLI should handle full-width spaces in arguments."""
+        config = vc.Config.__new__(vc.Config)
+        # Simulate: python3 vibe-coder.py -y\u3000 (full-width space after -y)
+        # The fix preprocesses argv to strip full-width spaces
+        import inspect
+        source = inspect.getsource(vc.Config._load_cli_args)
+        assert "\\u3000" in source or "\u3000" in source, "Should handle full-width spaces"

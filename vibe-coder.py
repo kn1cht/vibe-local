@@ -103,6 +103,14 @@ def _ansi(code):
     """Return ANSI escape code only if colors are enabled. Use for inline color codes."""
     return code if C._enabled else ""
 
+def _rl_ansi(code):
+    """Wrap ANSI code for readline so it doesn't count toward visible prompt length.
+    Use this ONLY in strings passed to input() — not for print()."""
+    a = _ansi(code)
+    if not a or not HAS_READLINE:
+        return a
+    return f"\001{a}\002"
+
 def _get_terminal_width():
     """Get terminal width, defaulting to 80."""
     try:
@@ -238,6 +246,10 @@ class Config:
             self.debug = True
 
     def _load_cli_args(self, argv=None):
+        # Strip full-width spaces from args (common with Japanese IME input)
+        if argv is None:
+            import sys as _sys
+            argv = [a.replace('\u3000', ' ').strip() for a in _sys.argv[1:]]
         parser = argparse.ArgumentParser(
             prog="vibe-coder",
             description="Open-source coding agent powered by Ollama",
@@ -360,15 +372,20 @@ class Config:
                 print(f"  Try: sudo mkdir -p {d} && sudo chown $USER {d}", file=sys.stderr)
             except OSError as e:
                 print(f"Warning: Cannot create directory {d}: {e}", file=sys.stderr)
-        # Migrate old vibe-coder sessions to new vibe-local location
+        # Migrate old vibe-coder sessions to new vibe-local location (once only)
         old_sessions = os.path.join(self._old_state_dir, "sessions")
-        if os.path.isdir(old_sessions) and not os.path.islink(self.sessions_dir):
+        migration_marker = os.path.join(self.sessions_dir, ".migrated")
+        if (os.path.isdir(old_sessions) and not os.path.islink(self.sessions_dir)
+                and not os.path.exists(migration_marker)):
             try:
                 for name in os.listdir(old_sessions):
                     src = os.path.join(old_sessions, name)
                     dst = os.path.join(self.sessions_dir, name)
                     if os.path.exists(src) and not os.path.exists(dst):
                         shutil.copytree(src, dst) if os.path.isdir(src) else shutil.copy2(src, dst)
+                # Write marker to skip migration on future startups
+                with open(migration_marker, "w") as f:
+                    f.write("migrated\n")
             except (OSError, shutil.Error):
                 pass  # Best-effort migration
         # Migrate old history file
@@ -677,28 +694,28 @@ class OllamaClient:
         try:
             resp = urllib.request.urlopen(req, timeout=self.timeout)
         except urllib.error.HTTPError as e:
-            body = ""
+            error_body = ""
             try:
-                body = e.read().decode("utf-8", errors="replace")[:500]
+                error_body = e.read().decode("utf-8", errors="replace")[:500]
             except Exception:
                 pass
             if e.code == 404:
                 raise RuntimeError(f"Model '{model}' not found. Run: ollama pull {model}") from e
             elif e.code == 400:
-                if "tool" in body.lower() or "function" in body.lower():
+                if "tool" in error_body.lower() or "function" in error_body.lower():
                     raise RuntimeError(
                         f"Model '{model}' does not support tool/function calling. "
-                        f"Try: qwen3:8b, llama3.1:8b. Error: {body[:200]}"
+                        f"Try: qwen3:8b, llama3.1:8b. Error: {error_body[:200]}"
                     ) from e
-                elif "context" in body.lower() or "token" in body.lower():
+                elif "context" in error_body.lower() or "token" in error_body.lower():
                     raise RuntimeError(
                         f"Context window exceeded for '{model}'. "
-                        f"Use /compact or /clear. Error: {body[:200]}"
+                        f"Use /compact or /clear. Error: {error_body[:200]}"
                     ) from e
                 else:
-                    raise RuntimeError(f"Bad request to Ollama (400): {body}") from e
+                    raise RuntimeError(f"Bad request to Ollama (400): {error_body}") from e
             else:
-                raise RuntimeError(f"Ollama HTTP error {e.code}: {body}") from e
+                raise RuntimeError(f"Ollama HTTP error {e.code}: {error_body}") from e
 
         if stream:
             return self._iter_sse(resp)
@@ -1883,6 +1900,8 @@ class WebFetchTool(Tool):
                     return super().redirect_request(req, fp, code, msg, headers, newurl)
 
             opener = urllib.request.build_opener(_SafeRedirectHandler)
+            # Encode non-ASCII characters in URL path/query (e.g. Japanese search terms)
+            url = urllib.parse.quote(url, safe=':/?#[]@!$&\'()*+,;=-._~%')
             req = urllib.request.Request(url, headers={
                 "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                               "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -2994,9 +3013,12 @@ class Session:
             # All remaining messages are tool results — keep at least some messages
             cut = len(self.messages) - self.MAX_MESSAGES
         self.messages = self.messages[cut:]
-        # Ensure the message list doesn't start with orphaned tool results
-        while len(self.messages) > 1 and self.messages[0].get("role") == "tool":
-            self.messages.pop(0)
+        # Ensure the message list doesn't start with orphaned tool results (O(n) slice instead of O(n^2) pop)
+        skip = 0
+        while skip < len(self.messages) - 1 and self.messages[skip].get("role") == "tool":
+            skip += 1
+        if skip > 0:
+            self.messages = self.messages[skip:]
         # Guard: never erase all history
         if not self.messages:
             self.messages = [{"role": "user", "content": "(history trimmed)"}]
@@ -3004,11 +3026,22 @@ class Session:
 
     def _recalculate_tokens(self):
         """Recalculate token estimate from current messages."""
-        self._token_estimate = sum(
-            self._estimate_tokens(m.get("content") or "") +
-            (len(json.dumps(m.get("tool_calls", []), ensure_ascii=False)) // 4 if m.get("tool_calls") else 0)
-            for m in self.messages
-        )
+        total = 0
+        for m in self.messages:
+            content = m.get("content")
+            if isinstance(content, list):
+                # Multipart content (e.g. image messages): sum text parts + estimate images
+                for part in content:
+                    if isinstance(part, dict):
+                        if part.get("type") == "text":
+                            total += self._estimate_tokens(part.get("text", ""))
+                        elif part.get("type") == "image_url":
+                            total += 800  # approximate token cost for an image
+            else:
+                total += self._estimate_tokens(content or "")
+            if m.get("tool_calls"):
+                total += len(json.dumps(m["tool_calls"], ensure_ascii=False)) // 4
+        self._token_estimate = total
 
     def add_user_message(self, text):
         self.messages.append({"role": "user", "content": text})
@@ -3179,6 +3212,11 @@ class Session:
                 # Skip orphaned tool results at start of remaining messages
                 while remaining and remaining[0].get("role") == "tool":
                     remaining.pop(0)
+                # Drop leading assistant with tool_calls if matching tool results were dropped
+                if remaining and remaining[0].get("role") == "assistant" and remaining[0].get("tool_calls"):
+                    # Check if the next message is a matching tool result
+                    if len(remaining) < 2 or remaining[1].get("role") != "tool":
+                        remaining.pop(0)
                 self.messages = [summary_msg] + remaining
                 self._last_compact_msg_count = len(self.messages)  # post-compaction count
                 self._recalculate_tokens()
@@ -3247,7 +3285,8 @@ class Session:
                     os.unlink(tmp_path)
                 except OSError:
                     pass
-        except (OSError, IOError) as e:
+                raise  # propagate to outer handler for user warning
+        except Exception as e:
             print(f"\n{C.YELLOW}Warning: Session save failed: {e}{C.RESET}", file=sys.stderr)
             if self.config.debug:
                 traceback.print_exc()
@@ -3321,8 +3360,8 @@ class Session:
         sessions_dir = config.sessions_dir
         if not os.path.isdir(sessions_dir):
             return sessions
-        for f in sorted(os.listdir(sessions_dir), reverse=True)[:50]:
-            if f.endswith(".jsonl"):
+        jsonl_files = [f for f in os.listdir(sessions_dir) if f.endswith(".jsonl")]
+        for f in sorted(jsonl_files, reverse=True)[:50]:
                 sid = f[:-6]
                 path = os.path.join(sessions_dir, f)
                 try:
@@ -3477,20 +3516,21 @@ class TUI:
         IME-safe: in CJK locales, waits for a brief pause after Enter
         to avoid sending during kanji conversion."""
         try:
-            # Plan mode indicator
-            plan_tag = f"{_ansi(chr(27)+'[38;5;226m')}[PLAN]{C.RESET} " if plan_mode else ""
+            # Plan mode indicator — use _rl_ansi for readline-safe ANSI in prompts
+            _rl_reset = _rl_ansi(C.RESET if C._enabled else "")
+            plan_tag = f"{_rl_ansi(chr(27)+'[38;5;226m')}[PLAN]{_rl_reset} " if plan_mode else ""
             # Show context usage indicator in prompt
             if session:
                 pct = min(int((session.get_token_estimate() / session.config.context_window) * 100), 100)
                 if pct < 50:
-                    ctx_color = _ansi("\033[38;5;240m")
+                    ctx_color = _rl_ansi("\033[38;5;240m")
                 elif pct < 80:
-                    ctx_color = _ansi("\033[38;5;226m")
+                    ctx_color = _rl_ansi("\033[38;5;226m")
                 else:
-                    ctx_color = _ansi("\033[38;5;196m")
-                prompt_str = f"{plan_tag}{ctx_color}ctx:{pct}%{C.RESET} {_ansi(chr(27)+'[38;5;51m')}❯{C.RESET} "
+                    ctx_color = _rl_ansi("\033[38;5;196m")
+                prompt_str = f"{plan_tag}{ctx_color}ctx:{pct}%{_rl_reset} {_rl_ansi(chr(27)+'[38;5;51m')}❯{_rl_reset} "
             else:
-                prompt_str = f"{plan_tag}{_ansi(chr(27)+'[38;5;51m')}❯{C.RESET} "
+                prompt_str = f"{plan_tag}{_rl_ansi(chr(27)+'[38;5;51m')}❯{_rl_reset} "
             line = input(prompt_str)
             return line
         except (EOFError, KeyboardInterrupt):
@@ -3695,6 +3735,7 @@ class TUI:
         """Display a tool call being made with Claude Code-style formatting."""
         self.stop_spinner()
         icon, color = self._tool_icons().get(name, ("🔧", C.YELLOW))
+        self._term_cols = _get_terminal_width()  # refresh on each call
         max_display = self._term_cols - 10
 
         if name == "Bash":
@@ -3707,7 +3748,9 @@ class TUI:
             limit = params.get("limit")
             range_str = ""
             if offset or limit:
-                range_str = f" {_ansi(chr(27)+'[38;5;240m')}(L{offset or 1}-{(offset or 1) + (limit or 2000)}){C.RESET}"
+                start = offset or 1
+                end = start + (limit or 2000) - 1
+                range_str = f" {_ansi(chr(27)+'[38;5;240m')}(L{start}-{end}){C.RESET}"
             path_display = path if len(path) <= max_display else "..." + path[-(max_display-3):]
             print(f"\n  {color}{icon} {name}{C.RESET} {_ansi(chr(27)+'[38;5;240m')}→{C.RESET} {C.WHITE}{path_display}{C.RESET}{range_str}")
         elif name == "Write":
@@ -3725,12 +3768,16 @@ class TUI:
             # Show diff-style preview
             print(f"\n  {color}{icon} {name}{C.RESET} {_ansi(chr(27)+'[38;5;240m')}→{C.RESET} {C.WHITE}{path_display}{C.RESET}")
             # Show abbreviated old/new for review
-            old_preview = old.split('\n')[0][:60] if old else ""
-            new_preview = new.split('\n')[0][:60] if new else ""
+            old_first = old.split('\n')[0] if old else ""
+            new_first = new.split('\n')[0] if new else ""
+            old_preview = old_first[:60]
+            new_preview = new_first[:60]
+            old_truncated = len(old_first) > 60 or '\n' in old
+            new_truncated = len(new_first) > 60 or '\n' in new
             if old_preview:
-                print(f"  {_ansi(chr(27)+'[38;5;196m')}  - {old_preview}{'...' if len(old) > 60 else ''}{C.RESET}")
+                print(f"  {_ansi(chr(27)+'[38;5;196m')}  - {old_preview}{'...' if old_truncated else ''}{C.RESET}")
             if new_preview:
-                print(f"  {_ansi(chr(27)+'[38;5;46m')}  + {new_preview}{'...' if len(new) > 60 else ''}{C.RESET}")
+                print(f"  {_ansi(chr(27)+'[38;5;46m')}  + {new_preview}{'...' if new_truncated else ''}{C.RESET}")
         elif name in ("Glob", "Grep"):
             pat = params.get("pattern", "")
             search_path = params.get("path", "")
@@ -3895,7 +3942,7 @@ class TUI:
         print(f"""
   {_c51}{C.BOLD}━━ Commands {sep[11:]}{C.RESET}
   {_c198}/help{C.RESET}              Show this help
-  {_c198}/exit{C.RESET}, {_c198}/quit{C.RESET}, {_c198}/q{C.RESET}  Exit vibe-coder
+  {_c198}/exit{C.RESET}, {_c198}/quit{C.RESET}, {_c198}/q{C.RESET}  Exit vibe-local
   {_c198}/clear{C.RESET}             Clear conversation
   {_c198}/model{C.RESET} <name>      Switch model
   {_c198}/status{C.RESET}            Session info
@@ -4050,8 +4097,12 @@ class Agent:
                         response, known_tools=self.registry.names()
                     )
                 else:
-                    # Streaming response
-                    text, tool_calls = self.tui.stream_response(response)
+                    # Streaming response — ensure generator is closed on exit
+                    try:
+                        text, tool_calls = self.tui.stream_response(response)
+                    finally:
+                        if hasattr(response, 'close'):
+                            response.close()
 
                 # Reconcile token estimate with actual usage from API
                 # Skip reconciliation right after compaction to avoid drift
