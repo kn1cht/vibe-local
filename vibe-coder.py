@@ -350,6 +350,7 @@ class Config:
         "qwen3:235b": 32768,
         "deepseek-coder-v2:236b": 131072,
         # Tier B — Advanced (48GB+ RAM)
+        "gpt-oss:120b": 131072,
         "mixtral:8x22b": 65536,
         "command-r-plus": 131072,
         "llama3.3:70b": 131072,
@@ -390,6 +391,7 @@ class Config:
         ("deepseek-coder-v2:236b",  256, "A"),
         ("llama3.1:405b",           512, "A"),
         # Tier B — Advanced: very strong coding, sweet spot for high-RAM machines
+        ("gpt-oss:120b",             96, "B"),  # MoE 117B (5.1B active), ~70tok/s, 131K ctx
         ("llama3.3:70b",             96, "B"),
         ("deepseek-r1:70b",          96, "B"),
         ("qwen2.5:72b",              96, "B"),

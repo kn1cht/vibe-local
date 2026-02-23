@@ -81,7 +81,8 @@ vibe-local --model qwen3:8b
 
 | 環境 | メモリ | メインモデル | サイドカー | 備考 |
 |------|--------|-------------|-----------|------|
-| Apple Silicon Mac (M1以降) | 32GB+ | qwen3-coder:30b | qwen3:8b | **推奨** |
+| Apple Silicon Mac (M1以降) | 96GB+ | gpt-oss:120b | qwen3:8b | **最速推奨** ~70tok/s |
+| Apple Silicon Mac (M1以降) | 32GB+ | qwen3-coder:30b | qwen3:8b | 推奨 |
 | Apple Silicon Mac (M1以降) | 16GB | qwen3:8b | qwen3:1.7b | 十分実用的 |
 | Apple Silicon Mac (M1以降) | 8GB | qwen3:1.7b | なし | 最低限動作 |
 | Intel Mac | 16GB+ | qwen3:8b | qwen3:1.7b | 動作するが遅め |
@@ -269,7 +270,8 @@ vibe-local --model qwen3:8b
 
 | Environment | RAM | Main Model | Sidecar | Notes |
 |-------------|-----|------------|---------|-------|
-| Apple Silicon Mac (M1+) | 32GB+ | qwen3-coder:30b | qwen3:8b | **Recommended** |
+| Apple Silicon Mac (M1+) | 96GB+ | gpt-oss:120b | qwen3:8b | **Fastest** ~70tok/s |
+| Apple Silicon Mac (M1+) | 32GB+ | qwen3-coder:30b | qwen3:8b | Recommended |
 | Apple Silicon Mac (M1+) | 16GB | qwen3:8b | qwen3:1.7b | Very capable |
 | Apple Silicon Mac (M1+) | 8GB | qwen3:1.7b | none | Minimum viable |
 | Intel Mac | 16GB+ | qwen3:8b | qwen3:1.7b | Works but slower |
@@ -371,7 +373,8 @@ vibe-local --model qwen3:8b
 
 | 环境 | 内存 | 主模型 | 边车模型 | 备注 |
 |------|------|--------|---------|------|
-| Apple Silicon Mac (M1及以上) | 32GB+ | qwen3-coder:30b | qwen3:8b | **推荐** |
+| Apple Silicon Mac (M1及以上) | 96GB+ | gpt-oss:120b | qwen3:8b | **最快** ~70tok/s |
+| Apple Silicon Mac (M1及以上) | 32GB+ | qwen3-coder:30b | qwen3:8b | 推荐 |
 | Apple Silicon Mac (M1及以上) | 16GB | qwen3:8b | qwen3:1.7b | 足够实用 |
 | Apple Silicon Mac (M1及以上) | 8GB | qwen3:1.7b | 无 | 最低限运行 |
 | Intel Mac | 16GB+ | qwen3:8b | qwen3:1.7b | 可运行但较慢 |
@@ -606,7 +609,7 @@ vibe-local auto-detects installed Ollama models and picks the best one for your 
 |------|-----------------|--------|---------|-------|
 | **S** Frontier | 768GB+ | `deepseek-r1:671b`, `deepseek-v3:671b` | Best reasoning | Slow |
 | **A** Expert | 256GB+ | `qwen3:235b`, `llama3.1:405b` | Excellent | Moderate |
-| **B** Advanced | 96GB+ | `llama3.3:70b`, `mixtral:8x22b` | Very strong | Good |
+| **B** Advanced | 96GB+ | `gpt-oss:120b`, `llama3.3:70b`, `mixtral:8x22b` | Very strong | Good (~70tok/s for gpt-oss) |
 | **C** Solid | 16GB+ | `qwen3-coder:30b`, `qwen2.5-coder:32b` | Good balance | Fast |
 | **D** Light | 8GB+ | `qwen3:8b`, `llama3.1:8b` | Decent | Very fast |
 | **E** Minimal | 4GB+ | `qwen3:1.7b`, `llama3.2:3b` | Basic | Instant |
