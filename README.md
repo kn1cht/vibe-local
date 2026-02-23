@@ -37,10 +37,10 @@ MacやWindows、LinuxにコマンドをコピペするだけでAIがコードを
 **エージェントのコア `vibe-coder.py` は Python 標準ライブラリだけで書かれた単一ファイルです。** pip install 不要、外部パッケージ依存ゼロ。ソースコードはそのまま読めるため、AIコーディングエージェントの仕組みを学ぶ教材としても、研究のベースラインとしても使えます。すべてがオープンソース (MIT) で公開されています。
 
 ```
-vibe-local → vibe-coder.py (OSS, Python stdlib only, ~6200行) → Ollama (直接通信)
+vibe-local → vibe-coder.py (OSS, Python stdlib only, ~6500行) → Ollama (直接通信)
 ```
 
-ログイン不要・Node.js不要・プロキシプロセス不要。15個の内蔵ツール、サブエージェント、画像・PDF読み取り対応。MCP連携・スキルシステム・Plan/Actモード・Gitチェックポイント・自動テスト搭載。628テスト。
+ログイン不要・Node.js不要・プロキシプロセス不要。16個の内蔵ツール、サブエージェント、並列エージェント、ファイル監視、画像・PDF読み取り対応。MCP連携・スキルシステム・Plan/Actモード・Gitチェックポイント・自動テスト搭載。652テスト。
 
 ### インストール (3ステップ)
 
@@ -186,6 +186,7 @@ vibe-local -p "Pythonで じゃんけんゲームを つくって"
 | `/checkpoint` | いまの じょうたいを ほぞんする |
 | `/rollback` | ほぞんした じょうたいに もどす |
 | `/autotest` | じどう テスト ON/OFF |
+| `/watch` | ファイルの へんこうを みはる ON/OFF |
 | `/yes` | じどう きょか モード オン |
 | `"""` | ながい ぶんしょうを にゅうりょく する |
 | `Ctrl+C` | とめる / おわる |
@@ -224,10 +225,10 @@ No network required. Completely free. **Python + Ollama only** — a fully open-
 **The core agent `vibe-coder.py` is a single file written entirely with the Python standard library.** No pip install needed. Zero external dependencies. The source code is human-readable as-is, making it ideal as teaching material for understanding how AI coding agents work, or as a research baseline. Everything is open source (MIT).
 
 ```
-vibe-local → vibe-coder.py (OSS, Python stdlib only, ~6200 lines) → Ollama (direct)
+vibe-local → vibe-coder.py (OSS, Python stdlib only, ~6500 lines) → Ollama (direct)
 ```
 
-No login. No Node.js. No proxy process. 15 built-in tools, sub-agents, image/PDF reading. MCP integration, Skills system, Plan/Act mode, Git checkpoints, auto-test loop. 628 tests.
+No login. No Node.js. No proxy process. 16 built-in tools, sub-agents, parallel agents, file watcher, image/PDF reading. MCP integration, Skills system, Plan/Act mode, Git checkpoints, auto-test loop. 652 tests.
 
 ### Install (3 steps)
 
@@ -326,10 +327,10 @@ VIBE_LOCAL_DEBUG=1 vibe-local
 **核心代理 `vibe-coder.py` 是仅使用 Python 标准库编写的单一文件。** 无需 pip install，零外部依赖。源代码直接可读，非常适合作为学习AI编程代理工作原理的教材或研究基线。一切以开源 (MIT) 形式公开。
 
 ```
-vibe-local → vibe-coder.py (开源, 纯Python标准库, ~6200行) → Ollama (直接通信)
+vibe-local → vibe-coder.py (开源, 纯Python标准库, ~6500行) → Ollama (直接通信)
 ```
 
-无需登录、无需Node.js、无需代理进程。15个内置工具、子代理、图像/PDF读取支持。MCP集成、技能系统、Plan/Act模式、Git检查点、自动测试循环。628项测试。
+无需登录、无需Node.js、无需代理进程。16个内置工具、子代理、并行代理、文件监视、图像/PDF读取支持。MCP集成、技能系统、Plan/Act模式、Git检查点、自动测试循环。652项测试。
 
 ### 安装（3步）
 
@@ -430,18 +431,19 @@ VIBE_LOCAL_DEBUG=1 vibe-local
                          │
                          ▼
 ┌────────────────────────────────────────────────────────────┐
-│  vibe-coder.py  (single file, Python stdlib only, ~6200L)  │
+│  vibe-coder.py  (single file, Python stdlib only, ~6500L)  │
 │                                                            │
 │  ┌──────────────────────────────────────────────────────┐  │
 │  │  Agent Loop (parallel tool execution)                │  │
 │  │  User input → LLM → Tool calls → Execute →          │  │
 │  │  Add results → Loop until done                       │  │
 │  ├──────────────────────────────────────────────────────┤  │
-│  │  15 Built-in Tools + MCP Tools                       │  │
+│  │  16 Built-in Tools + MCP Tools                       │  │
 │  │  Bash (+ background), Read (+ images/PDF/ipynb),     │  │
 │  │  Write, Edit (+ rich diff), Glob, Grep,              │  │
 │  │  WebFetch, WebSearch, NotebookEdit, SubAgent,        │  │
-│  │  TaskCreate/List/Get/Update, AskUserQuestion         │  │
+│  │  ParallelAgents, TaskCreate/List/Get/Update,         │  │
+│  │  AskUserQuestion                                     │  │
 │  ├──────────────────────────────────────────────────────┤  │
 │  │  v1.0 Extensions                                    │  │
 │  │  MCP Client (JSON-RPC 2.0, stdio, tool discovery)   │  │
@@ -449,6 +451,11 @@ VIBE_LOCAL_DEBUG=1 vibe-local
 │  │  Plan/Act Mode (read-only → execution transition)    │  │
 │  │  Git Checkpoint (stash-based rollback)               │  │
 │  │  Auto Test Loop (lint + test after edits)            │  │
+│  ├──────────────────────────────────────────────────────┤  │
+│  │  v1.1 Extensions                                    │  │
+│  │  File Watcher (poll-based change detection)          │  │
+│  │  Parallel Agents (multi-task concurrent execution)   │  │
+│  │  Streaming Enhancement (tool call delta accumulation)│  │
 │  ├──────────────────────────────────────────────────────┤  │
 │  │  System Prompt + OS-Specific Hints                   │  │
 │  │  macOS: brew, /Users/, system_profiler               │  │
@@ -487,7 +494,7 @@ There are many excellent open-source projects in the AI coding agent space. Each
 | API key required | Yes (or local) | Yes (or local) | Yes (or local) | Yes (OpenAI) | Yes (Google) | Yes (or local) | **No** |
 | Install | `pip install` | `go install` / brew | VS Code marketplace | `npm install` | `npm install` | Binary / installer | `curl \| bash` |
 | Interface | Terminal | Terminal (rich TUI) | VS Code | Terminal | Terminal | Terminal + Desktop | Terminal |
-| Strength | Git-aware, multi-model | Beautiful TUI, speed | Deep IDE integration | OpenAI ecosystem | Google ecosystem | Extensible, MCP | Simplicity, education, MCP |
+| Strength | Git-aware, multi-model | Beautiful TUI, speed | Deep IDE integration | OpenAI ecosystem | Google ecosystem | Extensible, MCP | Simplicity, education, MCP, parallel agents |
 | License | Apache 2.0 | MIT | Apache 2.0 | Apache 2.0 | Apache 2.0 | Apache 2.0 | MIT |
 
 > **aider** is one of the most mature CLI tools, with excellent git integration and multi-model support. **opencode** stands out with its beautiful Bubble Tea TUI and fast Go implementation. **Cline** provides deep VS Code integration that feels native. **Codex CLI** and **Gemini CLI** bring the power of OpenAI and Google ecosystems respectively. **Goose** (by Block) offers an extensible MCP-based agent framework. These are all excellent tools built by talented teams — if you're a professional developer, you should try them.
@@ -554,6 +561,7 @@ There are many excellent open-source projects in the AI coding agent space. Each
 | `/checkpoint` | Save git checkpoint | Gitチェックポイント保存 | 保存Git检查点 |
 | `/rollback` | Rollback to last checkpoint | チェックポイントに戻す | 回滚到上一个检查点 |
 | `/autotest` | Toggle auto lint+test after edits | 自動テストON/OFF | 自动测试开关 |
+| `/watch` | Toggle file watcher | ファイル監視ON/OFF | 文件监视开关 |
 | `/skills` | List loaded skills | スキル一覧 | 列出已加载技能 |
 | `/init` | Create CLAUDE.md | CLAUDE.md作成 | 创建CLAUDE.md |
 | `/yes` | Enable auto-approve | 自動許可ON | 启用自动批准 |
@@ -713,6 +721,46 @@ Load custom `.md` instruction files into the system prompt:
 
 ---
 
+## v1.1 Features / v1.1 新機能
+
+### File Watcher / ファイル監視
+
+Automatically detect external file changes and notify the LLM:
+
+```
+/watch      → Toggle file watcher ON/OFF
+```
+
+- Poll-based (2s interval), watches common source file extensions (.py, .js, .ts, .html, .css, .json, .go, .rs, etc.)
+- Detects: file created, modified, deleted
+- Changes are injected as system notes before the next LLM call
+- Snapshot refreshes after Write/Edit to avoid false positives
+
+外部エディタでのファイル変更を自動検出してLLMに通知。Write/Edit後はスナップショット更新で誤検知防止。
+
+### Parallel Agents / 並列エージェント
+
+Run multiple sub-agents concurrently for faster multi-task execution:
+
+- `ParallelAgents` tool: accepts 1-4 tasks, runs them in parallel threads
+- Each task is an independent sub-agent with its own context
+- 5-minute timeout per agent, max 4 concurrent
+- LLM automatically chooses ParallelAgents when multiple independent tasks are detected
+
+複数サブエージェントを並列実行。独立したタスクを同時処理して時間短縮。
+
+### Streaming Enhancement / ストリーミング強化
+
+Infrastructure for streaming tool call responses from Ollama:
+
+- TUI accumulates tool_call deltas from SSE stream chunks
+- `_supports_tool_streaming` flag for Ollama version detection
+- Falls back to sync mode when tool streaming is not supported
+
+ツールコール応答のストリーミング基盤。Ollamaバージョンに応じて自動切替。
+
+---
+
 ## Security
 
 > **Use this tool at your own risk. Pay attention to the commands the AI executes.**
@@ -796,6 +844,8 @@ vibe-local -p "Write Hello World in Python"
 | Auto test loop | Yes | |
 | MCP servers (local) | Yes | Depends on MCP server |
 | Skills system | Yes | |
+| File watcher | Yes | |
+| Parallel agents | Yes | |
 | Web search | Online only | DuckDuckGo |
 | URL fetch | Online only | |
 | Package install | Online only | pip/brew/winget |
