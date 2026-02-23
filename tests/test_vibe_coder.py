@@ -4859,7 +4859,7 @@ class TestTokenUsageDisplay:
 
     def test_version_bump(self):
         """Verify version was bumped for this feature release."""
-        assert vc.__version__ == "1.2.1"
+        assert vc.__version__ == "1.3.0"
 
     def test_bash_tool_has_run_in_background_param(self):
         tool = vc.BashTool()
@@ -8010,3 +8010,247 @@ class TestOneShotBannerSuppression:
             content = f.read()
         # The banner call should exist (not deleted entirely)
         assert "tui.banner(config, model_ok=True)" in content
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# InputMonitor (ESC key interrupt)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestInputMonitor:
+    """Tests for the InputMonitor ESC key detection class."""
+
+    def test_class_exists(self):
+        """InputMonitor class should be defined in the module."""
+        assert hasattr(vc, "InputMonitor")
+
+    def test_has_start_method(self):
+        """InputMonitor should have a start() method."""
+        mon = vc.InputMonitor()
+        assert callable(getattr(mon, "start", None))
+
+    def test_has_stop_method(self):
+        """InputMonitor should have a stop() method."""
+        mon = vc.InputMonitor()
+        assert callable(getattr(mon, "stop", None))
+
+    def test_has_pressed_property(self):
+        """InputMonitor should have a pressed property."""
+        mon = vc.InputMonitor()
+        assert isinstance(mon.pressed, bool)
+
+    def test_pressed_default_false(self):
+        """pressed should be False before start()."""
+        mon = vc.InputMonitor()
+        assert mon.pressed is False
+
+    def test_stop_is_noop_when_not_started(self):
+        """stop() should not raise if called without start()."""
+        mon = vc.InputMonitor()
+        mon.stop()  # should not raise
+
+    def test_start_noop_when_no_tty(self):
+        """start() should be a no-op when stdin is not a TTY."""
+        mon = vc.InputMonitor()
+        with mock.patch.object(sys.stdin, "isatty", return_value=False):
+            mon.start()
+        # No thread should be started
+        assert mon._thread is None
+
+    def test_has_termios_flag(self):
+        """Module should define HAS_TERMIOS boolean flag."""
+        assert hasattr(vc, "HAS_TERMIOS")
+        assert isinstance(vc.HAS_TERMIOS, bool)
+
+
+class TestBashToolStdinDevnull:
+    """Verify BashTool uses subprocess.DEVNULL for stdin."""
+
+    def test_stdin_devnull_in_source(self):
+        """BashTool.execute source must contain stdin=subprocess.DEVNULL."""
+        import inspect
+        source = inspect.getsource(vc.BashTool.execute)
+        assert "subprocess.DEVNULL" in source
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Compact tool display & status line tests
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestCompactToolDisplay:
+    """Tests for the compact single-line tool result display (Task 2)."""
+
+    def _make_tui(self):
+        cfg = vc.Config()
+        cfg.history_file = "/dev/null"
+        with mock.patch.object(vc.readline, "read_history_file", side_effect=Exception("skip")):
+            return vc.TUI(cfg)
+
+    def test_success_bash_compact(self, capsys):
+        """Successful Bash tool result shows checkmark, command, duration, line count."""
+        tui = self._make_tui()
+        tui.show_tool_result(
+            "Bash", "line1\nline2\nline3\n", is_error=False,
+            duration=0.3, params={"command": "git status"}
+        )
+        out = capsys.readouterr().out
+        assert "\u2714" in out  # checkmark
+        assert "Bash" in out
+        assert "git status" in out
+        assert "0.3s" in out
+        assert "3 lines" in out
+
+    def test_error_bash_compact(self, capsys):
+        """Failed Bash tool result shows X mark and error text."""
+        tui = self._make_tui()
+        tui.show_tool_result(
+            "Bash", "Error: command not found", is_error=True,
+            duration=0.1, params={"command": "invalid-cmd"}
+        )
+        out = capsys.readouterr().out
+        assert "\u2718" in out  # X mark
+        assert "Bash" in out
+        assert "invalid-cmd" in out
+        assert "0.1s" in out
+        assert "command not found" in out
+
+    def test_read_with_range(self, capsys):
+        """Read tool shows filename and line range."""
+        tui = self._make_tui()
+        tui.show_tool_result(
+            "Read", "some content\nmore content\n", is_error=False,
+            duration=0.05, params={"file_path": "/tmp/vibe-coder.py", "offset": 1, "limit": 50}
+        )
+        out = capsys.readouterr().out
+        assert "\u2714" in out
+        assert "Read" in out
+        assert "vibe-coder.py" in out
+        assert "1-50" in out
+
+    def test_websearch_compact(self, capsys):
+        """WebSearch shows quoted query."""
+        tui = self._make_tui()
+        tui.show_tool_result(
+            "WebSearch", "result1\nresult2\n", is_error=False,
+            duration=2.1, params={"query": "digital nature"}
+        )
+        out = capsys.readouterr().out
+        assert "\u2714" in out
+        assert "WebSearch" in out
+        assert '"digital nature"' in out
+        assert "2.1s" in out
+
+    def test_detail_lines_limited_to_3(self, capsys):
+        """Detail output shows at most 3 lines plus a 'more lines' indicator."""
+        tui = self._make_tui()
+        output = "\n".join([f"line {i}" for i in range(20)])
+        tui.show_tool_result(
+            "Bash", output, is_error=False,
+            duration=1.0, params={"command": "ls"}
+        )
+        out = capsys.readouterr().out
+        # Should see "line 0", "line 1", "line 2" in detail, but NOT "line 3"
+        assert "line 0" in out
+        assert "line 1" in out
+        assert "line 2" in out
+        assert "17 more lines" in out  # 20 - 3 = 17
+
+    def test_no_detail_on_error(self, capsys):
+        """Error results should not show detail lines."""
+        tui = self._make_tui()
+        tui.show_tool_result(
+            "Bash", "Error: bad\ndetail line\n", is_error=True,
+            duration=0.1, params={"command": "bad-cmd"}
+        )
+        out = capsys.readouterr().out
+        # The detail lines (with ┃ prefix) should NOT appear for errors
+        assert "\u2503" not in out
+
+    def test_no_duration_still_works(self, capsys):
+        """Calling without duration= still produces valid output."""
+        tui = self._make_tui()
+        tui.show_tool_result("Bash", "hello\n", is_error=False)
+        out = capsys.readouterr().out
+        assert "\u2714" in out
+        assert "Bash" in out
+
+    def test_no_params_still_works(self, capsys):
+        """Calling without params= still produces valid output."""
+        tui = self._make_tui()
+        tui.show_tool_result("Read", "content\n", is_error=False, duration=0.2)
+        out = capsys.readouterr().out
+        assert "\u2714" in out
+        assert "Read" in out
+        assert "0.2s" in out
+
+
+class TestStreamStatusLine:
+    """Tests for the in-place status line during streaming (Task 1)."""
+
+    def _make_tui(self):
+        cfg = vc.Config()
+        cfg.history_file = "/dev/null"
+        with mock.patch.object(vc.readline, "read_history_file", side_effect=Exception("skip")):
+            return vc.TUI(cfg)
+
+    def test_status_line_variables_initialized(self):
+        """stream_response should initialize status tracking variables."""
+        import inspect
+        source = inspect.getsource(vc.TUI.stream_response)
+        assert "_stream_start" in source
+        assert "_approx_tokens" in source
+        assert "_status_line_shown" in source
+
+    def test_status_line_cleared_before_header(self):
+        """stream_response should clear the status line before printing the header."""
+        import inspect
+        source = inspect.getsource(vc.TUI.stream_response)
+        # The code should contain clearing logic with spaces
+        assert "_status_line_shown = False" in source
+        assert "Thinking..." in source
+
+    def test_stream_basic_no_crash(self):
+        """stream_response with simple chunks should not crash."""
+        tui = self._make_tui()
+        chunks = [
+            {"choices": [{"delta": {"content": "Hello "}}]},
+            {"choices": [{"delta": {"content": "world"}}]},
+        ]
+        text, tool_calls = tui.stream_response(iter(chunks))
+        assert "Hello world" in text
+        assert tool_calls == []
+
+
+class TestToolStatusSpinner:
+    """Tests for the tool execution status spinner (Task 3)."""
+
+    def _make_tui(self):
+        cfg = vc.Config()
+        cfg.history_file = "/dev/null"
+        with mock.patch.object(vc.readline, "read_history_file", side_effect=Exception("skip")):
+            return vc.TUI(cfg)
+
+    def test_start_tool_status_method_exists(self):
+        """TUI should have a start_tool_status method."""
+        tui = self._make_tui()
+        assert hasattr(tui, "start_tool_status")
+        assert callable(tui.start_tool_status)
+
+    def test_start_tool_status_starts_and_stops(self, capsys):
+        """start_tool_status should start a thread; stop_spinner should stop it."""
+        tui = self._make_tui()
+        tui.is_interactive = True  # Force interactive mode for test
+        tui.start_tool_status("Bash")
+        assert tui._spinner_thread is not None
+        assert tui._spinner_thread.is_alive()
+        time.sleep(1.2)  # Let it tick at least once
+        tui.stop_spinner()
+        assert tui._spinner_thread is None
+        out = capsys.readouterr().out
+        assert "Running Bash" in out
+
+    def test_start_tool_status_non_interactive(self):
+        """start_tool_status should be a no-op when not interactive."""
+        tui = self._make_tui()
+        tui.is_interactive = False
+        tui.start_tool_status("Bash")
+        assert tui._spinner_thread is None

@@ -45,6 +45,15 @@ try:
 except ImportError:
     HAS_READLINE = False
 
+# termios/tty/select for ESC key detection (Unix only)
+try:
+    import termios
+    import tty
+    import select as _select_mod
+    HAS_TERMIOS = True
+except ImportError:
+    HAS_TERMIOS = False
+
 # Thread-safe stdout lock
 _print_lock = threading.Lock()
 from pathlib import Path
@@ -55,7 +64,7 @@ _bg_task_counter = [0]
 _bg_tasks_lock = threading.Lock()
 MAX_BG_TASKS = 50  # Prevent unbounded memory growth
 
-__version__ = "1.2.1"
+__version__ = "1.3.0"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -151,6 +160,77 @@ def _truncate_to_display_width(text, max_width):
             return text[:i] + "..."
         w += cw
     return text
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# ESC key interrupt monitor (Unix only)
+# ════════════════════════════════════════════════════════════════════════════════
+
+class InputMonitor:
+    """Detect ESC key press during agent execution using cbreak mode.
+
+    Unix-only: uses termios + tty.setcbreak for real-time key detection.
+    On Windows (or when termios is unavailable), all methods are no-ops.
+    """
+
+    def __init__(self):
+        self._pressed = threading.Event()
+        self._stop_event = threading.Event()
+        self._thread = None
+        self._old_settings = None
+
+    @property
+    def pressed(self):
+        """True if ESC was pressed since start()."""
+        return self._pressed.is_set()
+
+    def start(self):
+        """Begin monitoring stdin for ESC key in a daemon thread."""
+        if not HAS_TERMIOS or not sys.stdin.isatty():
+            return
+        self._pressed.clear()
+        self._stop_event.clear()
+        try:
+            self._old_settings = termios.tcgetattr(sys.stdin)
+        except termios.error:
+            return
+        try:
+            tty.setcbreak(sys.stdin.fileno())
+        except termios.error:
+            self._old_settings = None
+            return
+        self._thread = threading.Thread(target=self._poll, daemon=True)
+        self._thread.start()
+
+    def _poll(self):
+        """Poll stdin for ESC (0x1b) with 0.2s timeout."""
+        fd = sys.stdin.fileno()
+        while not self._stop_event.is_set():
+            try:
+                ready, _, _ = _select_mod.select([fd], [], [], 0.2)
+            except (OSError, ValueError):
+                break
+            if ready:
+                try:
+                    ch = os.read(fd, 1)
+                except OSError:
+                    break
+                if ch == b'\x1b':
+                    self._pressed.set()
+                    break
+
+    def stop(self):
+        """Stop monitoring and restore terminal settings."""
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1)
+            self._thread = None
+        if self._old_settings is not None:
+            try:
+                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self._old_settings)
+            except termios.error:
+                pass
+            self._old_settings = None
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -4908,6 +4988,12 @@ class TUI:
         # Accumulate tool_call deltas: {index: {"id": ..., "name": ..., "arguments": ...}}
         _tc_accum = {}
 
+        # Status line tracking for streaming progress
+        _stream_start = time.time()
+        _approx_tokens = 0
+        _last_status_update = 0.0
+        _status_line_shown = False
+
         for chunk in response_iter:
             choice = chunk.get("choices", [{}])[0]
             delta = choice.get("delta", {})
@@ -4928,9 +5014,30 @@ class TUI:
 
             content = delta.get("content", "")
             if not content:
+                # Even without content, update status line periodically
+                _now = time.time()
+                if not header_printed and (_now - _last_status_update) >= 0.5:
+                    _elapsed = _now - _stream_start
+                    _tok_display = f"{_approx_tokens / 1000:.1f}k" if _approx_tokens >= 1000 else str(_approx_tokens)
+                    _status_msg = f"  \U0001f4ad Thinking... ({_elapsed:.0f}s \u00b7 \u2193 {_tok_display} tokens)"
+                    print(f"\r{_status_msg}   ", end="", flush=True)
+                    _status_line_shown = True
+                    _last_status_update = _now
                 continue
+            # Approximate token count: ~4 chars per token
+            _approx_tokens += len(content) // 4 or 1
             raw_parts.append(content)
             think_buf += content
+
+            # Update status line while in think mode or before header printed
+            _now = time.time()
+            if not header_printed and (_now - _last_status_update) >= 0.5:
+                _elapsed = _now - _stream_start
+                _tok_display = f"{_approx_tokens / 1000:.1f}k" if _approx_tokens >= 1000 else str(_approx_tokens)
+                _status_msg = f"  \U0001f4ad Thinking... ({_elapsed:.0f}s \u00b7 \u2193 {_tok_display} tokens)"
+                print(f"\r{_status_msg}   ", end="", flush=True)
+                _status_line_shown = True
+                _last_status_update = _now
 
             # State machine: detect <think> and </think> tags even split across chunks
             while True:
@@ -4947,6 +5054,9 @@ class TUI:
                             to_print = ""
                         if to_print:
                             if not header_printed:
+                                if _status_line_shown:
+                                    print(f"\r{' ' * 60}\r", end="", flush=True)
+                                    _status_line_shown = False
                                 print(f"\n{C.BBLUE}assistant{C.RESET}: ", end="", flush=True)
                                 header_printed = True
                             print(to_print, end="", flush=True)
@@ -4956,6 +5066,9 @@ class TUI:
                         to_print = think_buf[:idx]
                         if to_print:
                             if not header_printed:
+                                if _status_line_shown:
+                                    print(f"\r{' ' * 60}\r", end="", flush=True)
+                                    _status_line_shown = False
                                 print(f"\n{C.BBLUE}assistant{C.RESET}: ", end="", flush=True)
                                 header_printed = True
                             print(to_print, end="", flush=True)
@@ -4971,6 +5084,11 @@ class TUI:
                     else:
                         think_buf = think_buf[idx + 8:]  # skip past </think>
                         in_think = False
+
+        # Clear status line before final output
+        if _status_line_shown:
+            print(f"\r{' ' * 60}\r", end="", flush=True)
+            _status_line_shown = False
 
         # Flush remaining buffer
         if think_buf and not in_think:
@@ -5154,37 +5272,96 @@ class TUI:
         else:
             print(f"\n  {color}{icon} {name}{C.RESET}")
 
-    def show_tool_result(self, name, result, is_error=False):
-        """Display tool result (abbreviated) with Claude Code-style output."""
+    def show_tool_result(self, name, result, is_error=False, duration=None, params=None):
+        """Display tool result with compact single-line summary + optional detail."""
         self.stop_spinner()
         output = result if isinstance(result, str) else str(result)
         # Strip ANSI escape sequences from tool output to prevent double-escaping (C16)
         output = self._ANSI_RE.sub('', output)
         lines = output.split("\n")
+        # Filter out empty trailing lines for accurate count
+        while lines and not lines[-1].strip():
+            lines.pop()
+        line_count = len(lines)
 
+        _dim = _ansi("\033[38;5;240m")
+        _red = _ansi("\033[38;5;196m")
+        _green = _ansi("\033[38;5;46m")
+
+        # Build compact summary: icon + tool name + key arg + duration + result summary
+        icon_char = "\u2718" if is_error else "\u2714"
+        icon_color = _red if is_error else _green
+
+        # Extract key argument for display (truncated to 60 chars)
+        key_arg = ""
+        if params:
+            if name == "Bash":
+                key_arg = " `" + _truncate_to_display_width(params.get("command", ""), 60) + "`"
+            elif name == "Read":
+                fp = params.get("file_path", "")
+                short = os.path.basename(fp) if fp else ""
+                offset = params.get("offset")
+                limit = params.get("limit")
+                if offset or limit:
+                    s = offset or 1
+                    e = s + (limit or 2000) - 1
+                    key_arg = f" {short}:{s}-{e}"
+                else:
+                    key_arg = f" {short}"
+            elif name in ("Write", "Edit"):
+                fp = params.get("file_path", "")
+                key_arg = f" {os.path.basename(fp)}" if fp else ""
+            elif name in ("Glob", "Grep"):
+                key_arg = " `" + _truncate_to_display_width(params.get("pattern", ""), 60) + "`"
+            elif name == "WebSearch":
+                key_arg = ' "' + _truncate_to_display_width(params.get("query", ""), 60) + '"'
+            elif name == "WebFetch":
+                key_arg = " " + _truncate_to_display_width(params.get("url", ""), 60)
+
+        # Duration string
+        dur_str = f"{duration:.1f}s" if duration is not None else ""
+
+        # Result summary
+        summary = ""
         if is_error:
-            marker = _ansi("\033[38;5;196m") + "  ✗"
-            color = _ansi("\033[38;5;196m")
-        else:
-            marker = _ansi("\033[38;5;240m") + "  ┃"
-            color = _ansi("\033[38;5;240m")
+            err_first = lines[0].strip() if lines else "Error"
+            summary = _truncate_to_display_width(err_first, 60)
+        elif name in ("Read", "Grep", "Bash", "Glob"):
+            summary = f"{line_count} lines"
+        elif name == "WebSearch":
+            summary = f"{line_count} lines"
+        elif name in ("Write", "Edit"):
+            summary = "ok"
 
-        # Show abbreviated output with line count
-        max_show = 12
-        if len(lines) <= max_show:
-            for line in lines:
-                # Truncate very long lines for display
+        # Assemble parenthetical: (0.3s, 12 lines) or (12 lines) or (0.3s)
+        paren_parts = []
+        if dur_str:
+            paren_parts.append(dur_str)
+        if summary and not is_error:
+            paren_parts.append(summary)
+        paren = f" ({', '.join(paren_parts)})" if paren_parts else ""
+
+        # Error suffix after paren
+        err_suffix = ""
+        if is_error and summary:
+            err_suffix = f" {summary}"
+
+        # Print compact summary line
+        print(f"  {icon_color}{icon_char}{C.RESET} {name}{_dim}{key_arg}{C.RESET}{_dim}{paren}{C.RESET}"
+              f"{_red}{err_suffix}{C.RESET}" if is_error else
+              f"  {icon_color}{icon_char}{C.RESET} {name}{_dim}{key_arg}{C.RESET}{_dim}{paren}{C.RESET}")
+
+        # Show first 3 lines of detail with ┃ prefix (collapsed by default)
+        detail_marker = _dim + "  \u2503"
+        max_detail = 3
+        if line_count > 0 and not is_error:
+            shown = min(max_detail, line_count)
+            for line in lines[:shown]:
                 display = _truncate_to_display_width(line, 200)
-                print(f"{marker} {color}{display}{C.RESET}")
-        else:
-            for line in lines[:6]:
-                display = _truncate_to_display_width(line, 200)
-                print(f"{marker} {color}{display}{C.RESET}")
-            remaining = len(lines) - 9
-            print(f"{marker} {_ansi(chr(27)+'[38;5;245m')}  ↕ {remaining} more lines{C.RESET}")
-            for line in lines[-3:]:
-                display = _truncate_to_display_width(line, 200)
-                print(f"{marker} {color}{display}{C.RESET}")
+                print(f"{detail_marker} {_dim}{display}{C.RESET}")
+            if line_count > max_detail:
+                remaining = line_count - max_detail
+                print(f"{detail_marker} {_ansi(chr(27)+'[38;5;245m')}  \u2195 {remaining} more lines{C.RESET}")
 
     def ask_permission(self, tool_name, params):
         """Ask user for permission — Claude Code style prompt."""
@@ -5273,6 +5450,30 @@ class TUI:
         if self._spinner_thread:
             self._spinner_thread.join(timeout=2)
             self._spinner_thread = None
+
+    def start_tool_status(self, tool_name):
+        """Show in-place status line during tool execution: Running Bash... (3s)
+        Updates every 1 second. Call stop_spinner() to clear."""
+        if not self.is_interactive:
+            return
+        self.stop_spinner()
+        self._spinner_stop.clear()
+        _icon, _color = self._tool_icons().get(tool_name, ("\U0001f527", C.YELLOW))
+        _start = time.time()
+
+        def _update():
+            while not self._spinner_stop.is_set():
+                elapsed = time.time() - _start
+                msg = f"  \U0001f527 Running {tool_name}... ({elapsed:.0f}s)"
+                with _print_lock:
+                    print(f"\r{msg}   ", end="", flush=True)
+                self._spinner_stop.wait(1.0)
+            # Clear the status line
+            with _print_lock:
+                print(f"\r{' ' * 60}\r", end="", flush=True)
+
+        self._spinner_thread = threading.Thread(target=_update, daemon=True)
+        self._spinner_thread.start()
 
     def show_help(self):
         """Show available commands with neon style."""
@@ -5457,8 +5658,15 @@ class Agent:
         _empty_retries = 0     # cap empty response retries
         _start_time = time.time()
 
+        # ESC key monitor for real-time interrupt
+        _esc_monitor = InputMonitor()
+        _esc_monitor.start()
+
         for iteration in range(self.MAX_ITERATIONS):
-            if self._interrupted.is_set():
+            if self._interrupted.is_set() or _esc_monitor.pressed:
+                if _esc_monitor.pressed:
+                    print(f"\n{C.YELLOW}Stopped (ESC pressed).{C.RESET}")
+                    self._interrupted.set()
                 break
 
             text = ""
@@ -5477,12 +5685,13 @@ class Agent:
                 if self._plan_mode:
                     tools = [t for t in tools
                              if t.get("function", {}).get("name") in self.PLAN_MODE_TOOLS]
+                _esc_hint = " — ESC: stop" if HAS_TERMIOS else ""
                 if iteration == 0:
-                    self.tui.start_spinner("Planning" if self._plan_mode else "Thinking")
+                    self.tui.start_spinner(("Planning" if self._plan_mode else "Thinking") + _esc_hint)
                 else:
                     elapsed = int(time.time() - _start_time)
                     self.tui.start_spinner(
-                        f"{'Planning' if self._plan_mode else 'Thinking'} (step {iteration+1}, {elapsed}s)"
+                        f"{'Planning' if self._plan_mode else 'Thinking'} (step {iteration+1}, {elapsed}s){_esc_hint}"
                     )
 
                 response = None
@@ -5640,12 +5849,16 @@ class Agent:
                 )
 
                 if all_parallel_safe:
+                    _parallel_durations = {}
                     def _exec_one(item):
                         tc_id, tool_name, tool_params, tool = item
                         try:
+                            _t0 = time.time()
                             output = tool.execute(tool_params)
+                            _parallel_durations[tc_id] = time.time() - _t0
                             return ToolResult(tc_id, output)
                         except Exception as e:
+                            _parallel_durations[tc_id] = time.time() - _t0
                             error_msg = f"Tool error: {e}"
                             return ToolResult(tc_id, error_msg, True)
 
@@ -5667,19 +5880,21 @@ class Agent:
 
                     # Show results in the original order of tool_calls
                     for tc_id, tool_name, tool_params, tool in validated_calls:
-                        if self._interrupted.is_set():
+                        if self._interrupted.is_set() or _esc_monitor.pressed:
                             break
                         future, _ = futures_map[tc_id]
                         try:
                             result = future.result()
                         except (concurrent.futures.CancelledError, Exception) as e:
                             result = ToolResult(tc_id, f"Tool error: {e}", True)
-                        self.tui.show_tool_result(tool_name, result.output, result.is_error)
+                        _pdur = _parallel_durations.get(tc_id)
+                        self.tui.show_tool_result(tool_name, result.output, result.is_error,
+                                                  duration=_pdur, params=tool_params)
                         results.append(result)
                 else:
                     # Sequential execution (preserves ordering for side-effecting tools)
                     for tc_id, tool_name, tool_params, tool in validated_calls:
-                        if self._interrupted.is_set():
+                        if self._interrupted.is_set() or _esc_monitor.pressed:
                             break
                         try:
                             # Git checkpoint before write/edit operations
@@ -5688,11 +5903,13 @@ class Agent:
 
                             is_long_op = tool_name in ("Bash", "WebFetch", "WebSearch")
                             if is_long_op:
-                                self.tui.start_spinner(f"Running {tool_name}")
+                                self.tui.start_tool_status(tool_name)
+                            _tool_t0 = time.time()
                             output = tool.execute(tool_params)
+                            _tool_dur = time.time() - _tool_t0
                             if is_long_op:
                                 self.tui.stop_spinner()
-                            self.tui.show_tool_result(tool_name, output)
+                            self.tui.show_tool_result(tool_name, output, duration=_tool_dur, params=tool_params)
                             results.append(ToolResult(tc_id, output))
 
                             # Refresh file watcher snapshot after writes
@@ -5716,14 +5933,16 @@ class Agent:
                                         ))
                         except KeyboardInterrupt:
                             self.tui.stop_spinner()
+                            _tool_dur = time.time() - _tool_t0
                             results.append(ToolResult(tc_id, "Interrupted by user", True))
-                            self.tui.show_tool_result(tool_name, "Interrupted", True)
+                            self.tui.show_tool_result(tool_name, "Interrupted", True, duration=_tool_dur, params=tool_params)
                             self._interrupted.set()
                             break
                         except Exception as e:
                             self.tui.stop_spinner()
+                            _tool_dur = time.time() - _tool_t0
                             error_msg = f"Tool error: {e}"
-                            self.tui.show_tool_result(tool_name, error_msg, True)
+                            self.tui.show_tool_result(tool_name, error_msg, True, duration=_tool_dur, params=tool_params)
                             results.append(ToolResult(tc_id, error_msg, True))
 
                 # 6. Add tool results to history
@@ -5810,6 +6029,9 @@ class Agent:
             print(f"\n{C.YELLOW}The AI took {self.MAX_ITERATIONS} steps without finishing.{C.RESET}")
             print(f"{C.DIM}Your work so far is saved. Try breaking the task into smaller steps,{C.RESET}")
             print(f"{C.DIM}or type /compact to free up context and continue.{C.RESET}")
+
+        # Always stop ESC monitor and restore terminal
+        _esc_monitor.stop()
 
     def interrupt(self):
         self._interrupted.set()
