@@ -553,6 +553,7 @@ class InputMonitor:
 
     def __init__(self, on_typeahead=None):
         self._pressed = threading.Event()
+        self._shift_tab = threading.Event()   # Shift+Tab detected
         self._stop_event = threading.Event()
         self._thread = None
         self._old_settings = None
@@ -564,6 +565,11 @@ class InputMonitor:
     def pressed(self):
         """True if ESC was pressed since start()."""
         return self._pressed.is_set()
+
+    @property
+    def shift_tab_pressed(self):
+        """True if Shift+Tab was pressed since start()."""
+        return self._shift_tab.is_set()
 
     def get_typeahead(self):
         """Return and clear any buffered type-ahead text (decoded as utf-8)."""
@@ -582,6 +588,7 @@ class InputMonitor:
         if not HAS_TERMIOS or not sys.stdin.isatty():
             return
         self._pressed.clear()
+        self._shift_tab.clear()
         self._stop_event.clear()
         with self._typeahead_lock:
             self._typeahead.clear()
@@ -611,6 +618,28 @@ class InputMonitor:
                 except OSError:
                     break
                 if ch == b'\x1b':
+                    # Could be Shift+Tab (\x1b[Z) or plain ESC
+                    # Peek ahead for '[' within a short timeout
+                    try:
+                        r2, _, _ = _select_mod.select([fd], [], [], 0.05)
+                    except (OSError, ValueError):
+                        r2 = []
+                    if r2:
+                        ch2 = os.read(fd, 1)
+                        if ch2 == b'[':
+                            try:
+                                r3, _, _ = _select_mod.select([fd], [], [], 0.05)
+                            except (OSError, ValueError):
+                                r3 = []
+                            if r3:
+                                ch3 = os.read(fd, 1)
+                                if ch3 == b'Z':
+                                    # Shift+Tab detected
+                                    self._shift_tab.set()
+                                    break
+                                # Other escape sequence — treat as ESC (interrupt)
+                            # '[' with no follow-up — treat as ESC
+                        # Non-'[' after ESC — treat as ESC
                     self._pressed.set()
                     break
                 elif ch == b'\x03':  # Ctrl+C
@@ -5186,6 +5215,8 @@ class TUI:
     # ANSI escape regex for stripping colors from tool output
     _ANSI_RE = re.compile(r'\033\[[0-9;]*[a-zA-Z]')
 
+    _SHIFT_TAB_SENTINEL = "\x00__SHIFT_TAB__\x00"  # sentinel for Shift+Tab in input
+
     def __init__(self, config):
         self.config = config
         self._spinner_stop = threading.Event()  # C3: thread-safe Event
@@ -5193,6 +5224,7 @@ class TUI:
         self.is_interactive = sys.stdin.isatty() and sys.stdout.isatty()
         self._is_cjk = self._detect_cjk_locale()
         self.scroll_region = ScrollRegion()
+        self._shift_tab_prefill = ""  # text being typed when Shift+Tab pressed
         try:
             self._term_cols = shutil.get_terminal_size((80, 24)).columns
         except (ValueError, OSError):
@@ -5355,33 +5387,267 @@ class TUI:
         cjk_prefixes = ("ja", "zh", "ko", "ja_JP", "zh_CN", "zh_TW", "ko_KR")
         return any(lang.startswith(p) for p in cjk_prefixes)
 
-    def show_input_separator(self):
+    def _build_prompt_str(self, session=None, plan_mode=False):
+        """Build the prompt string for display. Returns (visible_str, raw_str_for_display).
+        In Plan mode: [PLAN] tag (yellow) + ▸ prompt.
+        In Act mode: ❯ prompt (cyan).
+        """
+        _c226 = _ansi(chr(27) + '[38;5;226m')
+        _c51 = _ansi(chr(27) + '[38;5;51m')
+        _c240 = _ansi("\033[38;5;240m")
+        _c196 = _ansi("\033[38;5;196m")
+        _reset = C.RESET if C._enabled else ""
+
+        plan_tag = f"{_c226}[PLAN]{_reset} " if plan_mode else ""
+        prompt_char = f"{_c226}▸{_reset} " if plan_mode else f"{_c51}❯{_reset} "
+
+        if session:
+            pct = min(int((session.get_token_estimate() / session.config.context_window) * 100), 100)
+            if pct < 50:
+                ctx_color = _c240
+            elif pct < 80:
+                ctx_color = _c226
+            else:
+                ctx_color = _c196
+            return f"{plan_tag}{ctx_color}ctx:{pct}%{_reset} {prompt_char}"
+        return f"{plan_tag}{prompt_char}"
+
+    def _raw_input_with_shift_tab(self, prompt_str, prefill=""):
+        """Custom input loop using tty.setcbreak + os.read.
+        Bypasses readline/libedit entirely to reliably detect Shift+Tab (\\x1b[Z) on macOS.
+        Returns user input string, or _SHIFT_TAB_SENTINEL on Shift+Tab.
+        Returns None on Ctrl+D (EOF).
+        Raises KeyboardInterrupt on Ctrl+C.
+        """
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+        buf = list(prefill)  # current line buffer (chars)
+        history_idx = -1     # -1 = current line, 0 = most recent history item
+        saved_buf = ""       # saved current line when browsing history
+
+        # Print prompt + prefill
+        sys.stdout.write(prompt_str + prefill)
+        sys.stdout.flush()
+
+        try:
+            tty.setcbreak(fd)
+            while True:
+                try:
+                    ready, _, _ = _select_mod.select([fd], [], [], 0.1)
+                except (OSError, ValueError):
+                    break
+                if not ready:
+                    continue
+
+                ch = os.read(fd, 1)
+                if not ch:
+                    break
+
+                b = ch[0]
+
+                # ── Ctrl+C ──
+                if b == 0x03:
+                    sys.stdout.write("^C\n")
+                    sys.stdout.flush()
+                    raise KeyboardInterrupt
+
+                # ── Ctrl+D (EOF) ──
+                if b == 0x04:
+                    if not buf:
+                        sys.stdout.write("\n")
+                        sys.stdout.flush()
+                        return None
+                    continue  # ignore if buffer non-empty
+
+                # ── Enter ──
+                if b in (0x0A, 0x0D):
+                    sys.stdout.write("\n")
+                    sys.stdout.flush()
+                    line = "".join(buf)
+                    # Add to readline history for persistence
+                    if HAS_READLINE and line.strip():
+                        readline.add_history(line)
+                    return line
+
+                # ── Backspace ──
+                if b in (0x7F, 0x08):
+                    if buf:
+                        # Determine display width of removed char
+                        removed = buf.pop()
+                        w = 2 if ord(removed) > 0x7F else 1  # rough CJK width
+                        sys.stdout.write("\b" * w + " " * w + "\b" * w)
+                        sys.stdout.flush()
+                    continue
+
+                # ── Ctrl+U (kill line) ──
+                if b == 0x15:
+                    if buf:
+                        # Calculate display width and clear
+                        dw = sum(2 if ord(c) > 0x7F else 1 for c in buf)
+                        sys.stdout.write("\b" * dw + " " * dw + "\b" * dw)
+                        sys.stdout.flush()
+                        buf.clear()
+                    continue
+
+                # ── Ctrl+W (kill word) ──
+                if b == 0x17:
+                    if buf:
+                        # Remove trailing spaces then word chars
+                        removed_width = 0
+                        while buf and buf[-1] == " ":
+                            buf.pop()
+                            removed_width += 1
+                        while buf and buf[-1] != " ":
+                            c = buf.pop()
+                            removed_width += 2 if ord(c) > 0x7F else 1
+                        sys.stdout.write("\b" * removed_width + " " * removed_width + "\b" * removed_width)
+                        sys.stdout.flush()
+                    continue
+
+                # ── ESC sequence ──
+                if b == 0x1B:
+                    # Read next char with short timeout
+                    try:
+                        r2, _, _ = _select_mod.select([fd], [], [], 0.05)
+                    except (OSError, ValueError):
+                        r2 = []
+                    if r2:
+                        ch2 = os.read(fd, 1)
+                        if ch2 == b'[':
+                            try:
+                                r3, _, _ = _select_mod.select([fd], [], [], 0.05)
+                            except (OSError, ValueError):
+                                r3 = []
+                            if r3:
+                                ch3 = os.read(fd, 1)
+                                if ch3 == b'Z':
+                                    # Shift+Tab detected!
+                                    sys.stdout.write("\n")
+                                    sys.stdout.flush()
+                                    self._shift_tab_prefill = "".join(buf)
+                                    return self._SHIFT_TAB_SENTINEL
+                                elif ch3 == b'A':
+                                    # Up arrow — browse history
+                                    if HAS_READLINE:
+                                        max_idx = readline.get_current_history_length()
+                                        if history_idx < max_idx - 1:
+                                            if history_idx == -1:
+                                                saved_buf = "".join(buf)
+                                            history_idx += 1
+                                            item = readline.get_history_item(max_idx - history_idx) or ""
+                                            # Clear current line and show history item
+                                            dw = sum(2 if ord(c) > 0x7F else 1 for c in buf)
+                                            sys.stdout.write("\b" * dw + " " * dw + "\b" * dw)
+                                            buf = list(item)
+                                            sys.stdout.write(item)
+                                            sys.stdout.flush()
+                                    continue
+                                elif ch3 == b'B':
+                                    # Down arrow — browse history forward
+                                    if HAS_READLINE:
+                                        if history_idx > -1:
+                                            history_idx -= 1
+                                            if history_idx == -1:
+                                                item = saved_buf
+                                            else:
+                                                max_idx = readline.get_current_history_length()
+                                                item = readline.get_history_item(max_idx - history_idx) or ""
+                                            dw = sum(2 if ord(c) > 0x7F else 1 for c in buf)
+                                            sys.stdout.write("\b" * dw + " " * dw + "\b" * dw)
+                                            buf = list(item)
+                                            sys.stdout.write(item)
+                                            sys.stdout.flush()
+                                    continue
+                                # Other escape sequences (e.g., Left/Right) — ignore for now
+                            continue
+                        # Alt+key or other — ignore
+                    # Bare ESC — ignore in input mode
+                    continue
+
+                # ── UTF-8 multibyte ──
+                if b >= 0x80:
+                    # Determine how many continuation bytes we need
+                    if b & 0xE0 == 0xC0:
+                        remaining = 1
+                    elif b & 0xF0 == 0xE0:
+                        remaining = 2
+                    elif b & 0xF8 == 0xF0:
+                        remaining = 3
+                    else:
+                        continue  # invalid UTF-8 leader
+                    raw = bytes([b])
+                    for _ in range(remaining):
+                        try:
+                            r, _, _ = _select_mod.select([fd], [], [], 0.1)
+                        except (OSError, ValueError):
+                            r = []
+                        if r:
+                            raw += os.read(fd, 1)
+                    try:
+                        char = raw.decode("utf-8")
+                    except UnicodeDecodeError:
+                        continue
+                    buf.append(char)
+                    sys.stdout.write(char)
+                    sys.stdout.flush()
+                    continue
+
+                # ── Normal printable ASCII ──
+                if 0x20 <= b < 0x7F:
+                    char = chr(b)
+                    buf.append(char)
+                    sys.stdout.write(char)
+                    sys.stdout.flush()
+                    continue
+
+                # Other control chars — ignore
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+    def show_input_separator(self, plan_mode=False):
         """Print a subtle separator line before the input prompt.
         Visually delineates the input area from agent output above."""
         if not self.is_interactive:
             return
         # Thin separator: dim dotted line, adapts to terminal width
         sep_w = min(60, _get_terminal_width() - 4)
-        print(f"{C.DIM}{'·' * sep_w}{C.RESET}")
+        if plan_mode:
+            _c226 = _ansi(chr(27) + '[38;5;226m')
+            _c240 = _ansi("\033[38;5;240m")
+            lbl = f" PLAN MODE "
+            pad = sep_w - len(lbl) - 4
+            left = pad // 2
+            right = pad - left
+            print(f"{_c226}{'─' * left}{lbl}{'─' * right}  {_c240}Shift+Tab: Act mode{C.RESET}")
+        else:
+            print(f"{C.DIM}{'·' * sep_w}{C.RESET}")
 
     def get_input(self, session=None, plan_mode=False, prefill=""):
-        """Get user input with readline support. Returns None on EOF/exit.
-        IME-safe: in CJK locales, waits for a brief pause after Enter
-        to avoid sending during kanji conversion.
+        """Get user input with Shift+Tab detection.
+        Uses raw input loop on macOS/Linux (termios available) to reliably
+        detect Shift+Tab. Falls back to standard input() otherwise.
         prefill: pre-populate the input line (type-ahead from agent execution).
+        Returns _SHIFT_TAB_SENTINEL on Shift+Tab, None on EOF/exit.
         """
+        # Use raw input loop when termios is available and interactive
+        if HAS_TERMIOS and sys.stdin.isatty():
+            prompt_str = self._build_prompt_str(session=session, plan_mode=plan_mode)
+            try:
+                return self._raw_input_with_shift_tab(prompt_str, prefill=prefill)
+            except KeyboardInterrupt:
+                print()
+                return None
+
+        # Fallback: standard input() with readline
         try:
-            # Inject type-ahead text via readline startup hook
             if prefill and HAS_READLINE:
                 def _hook():
                     readline.insert_text(prefill)
                     readline.redisplay()
                 readline.set_startup_hook(_hook)
 
-            # Plan mode indicator — use _rl_ansi for readline-safe ANSI in prompts
             _rl_reset = _rl_ansi(C.RESET if C._enabled else "")
             plan_tag = f"{_rl_ansi(chr(27)+'[38;5;226m')}[PLAN]{_rl_reset} " if plan_mode else ""
-            # Show context usage indicator in prompt
             if session:
                 pct = min(int((session.get_token_estimate() / session.config.context_window) * 100), 100)
                 if pct < 50:
@@ -5399,7 +5665,6 @@ class TUI:
             print()
             return None
         finally:
-            # Always clear the startup hook after use
             if HAS_READLINE:
                 readline.set_startup_hook()
 
@@ -5411,6 +5676,7 @@ class TUI:
         - Single Enter to submit in non-CJK mode
         prefill: pre-populate the input line with type-ahead text.
         """
+        self.show_input_separator(plan_mode=plan_mode)
         # Keep DECSTBM active during input — footer stays visible.
         # Input/readline works within the scroll region (rows 1..scroll_end).
         _sr = self.scroll_region
@@ -5420,6 +5686,8 @@ class TUI:
             first_line = self.get_input(session=session, plan_mode=plan_mode, prefill=prefill)
             if first_line is None:
                 return None
+            if first_line == self._SHIFT_TAB_SENTINEL:
+                return first_line  # pass sentinel through to main loop
             if first_line.strip() == '"""':
                 # Explicit multi-line mode
                 lines = []
@@ -6025,8 +6293,9 @@ class TUI:
   {_c198}/diff{C.RESET}              Show git diff
   {_c198}/git{C.RESET} <args>        Run git commands
   {_c51}━━ Plan/Act Mode {sep[16:]}{C.RESET}
-  {_c198}/plan{C.RESET}              Enter plan mode (read-only)
-  {_c198}/approve{C.RESET}, {_c198}/act{C.RESET}     Switch to act mode (execute plan)
+  {_c198}/plan{C.RESET}              Enter plan mode (explore + write plan)
+  {_c198}/plan list{C.RESET}         List recent plan files
+  {_c198}/approve{C.RESET}, {_c198}/act{C.RESET}     Exit plan → act mode (inject plan)
   {_c198}/checkpoint{C.RESET}        Save git checkpoint
   {_c198}/rollback{C.RESET}          Rollback to last checkpoint
   {_c51}━━ Extensions {sep[13:]}{C.RESET}
@@ -6034,6 +6303,7 @@ class TUI:
   {_c198}/watch{C.RESET}             Toggle file watcher
   {_c198}/skills{C.RESET}            List loaded skills
   {_c51}━━ Keyboard {sep[11:]}{C.RESET}
+  {_c198}Shift+Tab{C.RESET}          Toggle Plan/Act mode
   {_c198}Ctrl+C{C.RESET}             Stop current task
   {_c198}Ctrl+C x2{C.RESET}          Exit (within 1.5s)
   {_c198}Ctrl+D{C.RESET}             Exit
@@ -6094,6 +6364,8 @@ class Agent:
     # Tools allowed in plan mode (read-only exploration + task tracking)
     PLAN_MODE_TOOLS = {
         "Read", "Glob", "Grep", "WebFetch", "WebSearch",
+        "Write",              # restricted to .vibe-local/plans/ only (runtime guard)
+        "AskUserQuestion",    # clarify requirements during planning
         "TaskCreate", "TaskList", "TaskGet", "TaskUpdate",
         "SubAgent",
     }
@@ -6111,6 +6383,8 @@ class Agent:
         self._interrupted = threading.Event()
         self._tui_lock = threading.Lock()
         self._plan_mode = False
+        self._active_plan_path = None     # current plan file path
+        self._shift_tab_toggle = False    # Shift+Tab mode toggle flag
         self.git_checkpoint = GitCheckpoint(config.cwd)
         self.auto_test = AutoTestRunner(config.cwd)
         self.file_watcher = FileWatcher(config.cwd)
@@ -6181,6 +6455,10 @@ class Agent:
         _esc_monitor.start()
 
         for iteration in range(self.MAX_ITERATIONS):
+            # Shift+Tab during agent execution → toggle plan/act mode
+            if _esc_monitor.shift_tab_pressed:
+                self._shift_tab_toggle = True
+                break
             if self._interrupted.is_set() or _esc_monitor.pressed:
                 if _esc_monitor.pressed:
                     _p(f"\n{C.YELLOW}Stopped (ESC pressed).{C.RESET}")
@@ -6353,6 +6631,24 @@ class Agent:
                     tool_name = tool.name
                     # Show what we're about to do FIRST
                     self.tui.show_tool_call(tool_name, tool_params)
+                    # Plan mode: restrict Write to .vibe-local/plans/ only
+                    if self._plan_mode and tool_name == "Write":
+                        try:
+                            fpath = os.path.realpath(tool_params.get("file_path", ""))
+                            plans_dir = os.path.realpath(os.path.join(self.config.cwd, ".vibe-local", "plans"))
+                            if not fpath.startswith(plans_dir + os.sep):
+                                results.append(ToolResult(
+                                    tc_id,
+                                    "Error: In plan mode, Write is restricted to .vibe-local/plans/ directory only. "
+                                    "Use /approve to switch to Act mode for unrestricted writes.",
+                                    True
+                                ))
+                                self.tui.show_tool_result(tool_name, "Blocked: outside plans/ dir", True)
+                                continue
+                        except Exception:
+                            results.append(ToolResult(tc_id, "Error: could not validate file path in plan mode.", True))
+                            self.tui.show_tool_result(tool_name, "Blocked: path validation error", True)
+                            continue
                     # Then ask permission
                     if not self.permissions.check(tool_name, tool_params, self.tui):
                         results.append(ToolResult(tc_id, "Permission denied by user. Do not retry this operation.", True))
@@ -6433,6 +6729,16 @@ class Agent:
                             self.tui.show_tool_result(tool_name, output, is_error=_is_err,
                                                       duration=_tool_dur, params=tool_params)
                             results.append(ToolResult(tc_id, output, _is_err))
+
+                            # Detect plan file creation
+                            if tool_name == "Write" and self._plan_mode and not _is_err:
+                                fpath = tool_params.get("file_path", "")
+                                try:
+                                    real_plans = os.path.realpath(os.path.join(self.config.cwd, ".vibe-local", "plans"))
+                                    if fpath and os.path.realpath(fpath).startswith(real_plans + os.sep):
+                                        self._active_plan_path = fpath
+                                except Exception:
+                                    pass
 
                             # Refresh file watcher snapshot after writes
                             if tool_name in ("Write", "Edit") and self.file_watcher.enabled:
@@ -6582,6 +6888,92 @@ def _show_model_list(models):
             print(f"    {_c}[{tier}]{C.RESET} {m}  {C.DIM}(ctx: {ctx}, ~{min_ram}GB+ RAM){C.RESET}")
         else:
             print(f"    {C.DIM}[?]{C.RESET} {m}")
+
+
+def _enter_plan_mode(agent, session):
+    """Switch agent to Plan mode with plan file setup and LLM guidance."""
+    if agent._plan_mode:
+        print(f"{C.YELLOW}Already in plan mode.{C.RESET}")
+        return
+    agent._plan_mode = True
+    # Ensure plans directory exists
+    plans_dir = os.path.join(agent.config.cwd, ".vibe-local", "plans")
+    os.makedirs(plans_dir, exist_ok=True)
+    # Pre-set plan path with timestamp
+    plan_name = time.strftime("plan-%Y%m%d-%H%M%S.md")
+    agent._active_plan_path = os.path.join(plans_dir, plan_name)
+    # Inject system note to guide LLM
+    session.add_system_note(
+        "[Plan Mode] You are now in Plan mode. Your task is to explore the codebase, "
+        "analyze the problem, and write a plan. Use Read, Glob, Grep, WebFetch, WebSearch "
+        "for exploration. Write your plan to the file: " + agent._active_plan_path + "\n"
+        "When your plan is complete, the user will use /approve to switch to Act mode."
+    )
+    # Banner
+    _c226 = _ansi(chr(27) + '[38;5;226m')
+    _c240 = _ansi(chr(27) + '[38;5;240m')
+    print(f"\n  {_c226}━━ Plan Mode ━━━━━━━━━━━━━━━━━━━━━━{C.RESET}")
+    print(f"  {_c226}Read-only exploration + plan writing.{C.RESET}")
+    print(f"  {_c240}Write restricted to: .vibe-local/plans/{C.RESET}")
+    print(f"  {_c240}Plan file: {plan_name}{C.RESET}")
+    print(f"  {_c240}Shift+Tab or /approve → Act mode{C.RESET}")
+    print(f"  {_c226}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.RESET}\n")
+
+
+def _read_latest_plan(agent):
+    """Read the active plan file content (max 8000 chars). Falls back to newest .md in plans/."""
+    plan_path = agent._active_plan_path
+    if plan_path and os.path.isfile(plan_path):
+        try:
+            with open(plan_path, "r", encoding="utf-8") as f:
+                return f.read()[:8000]
+        except Exception:
+            pass
+    # Fallback: find newest .md in plans/
+    plans_dir = os.path.join(agent.config.cwd, ".vibe-local", "plans")
+    if os.path.isdir(plans_dir):
+        md_files = sorted(
+            [os.path.join(plans_dir, f) for f in os.listdir(plans_dir) if f.endswith(".md")],
+            key=lambda p: os.path.getmtime(p) if os.path.isfile(p) else 0,
+            reverse=True,
+        )
+        if md_files:
+            try:
+                with open(md_files[0], "r", encoding="utf-8") as f:
+                    return f.read()[:8000]
+            except Exception:
+                pass
+    return ""
+
+
+def _exit_plan_mode(agent, session):
+    """Switch agent from Plan mode to Act mode, injecting the plan into context."""
+    if not agent._plan_mode:
+        print(f"{C.YELLOW}Not in plan mode.{C.RESET}")
+        return
+    plan_content = _read_latest_plan(agent)
+    agent._plan_mode = False
+    # Git checkpoint before entering Act mode
+    if agent.git_checkpoint._is_git_repo:
+        if agent.git_checkpoint.create("plan-to-act"):
+            print(f"  {_ansi(chr(27) + '[38;5;87m')}Git checkpoint saved (use /rollback to undo){C.RESET}")
+    # Inject plan into session context
+    if plan_content:
+        session.add_system_note(
+            "[Act Mode] The following plan was created in Plan mode. Implement it step by step.\n\n"
+            + plan_content
+        )
+    # Banner
+    _c46 = _ansi(chr(27) + '[38;5;46m')
+    _c240 = _ansi(chr(27) + '[38;5;240m')
+    plan_name = os.path.basename(agent._active_plan_path) if agent._active_plan_path else "(none)"
+    print(f"\n  {_c46}━━ Act Mode ━━━━━━━━━━━━━━━━━━━━━━━{C.RESET}")
+    print(f"  {_c46}All tools re-enabled. Implementing plan.{C.RESET}")
+    if plan_content:
+        print(f"  {_c240}Plan loaded: {plan_name} ({len(plan_content)} chars){C.RESET}")
+    print(f"  {_c240}Shift+Tab or /plan → return to Plan mode{C.RESET}")
+    print(f"  {_c240}/rollback → undo all changes since plan{C.RESET}")
+    print(f"  {_c46}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.RESET}\n")
 
 
 def main():
@@ -6834,6 +7226,16 @@ def main():
             _typeahead_text = ""  # consumed
             if user_input is None:
                 break
+
+            # Shift+Tab sentinel — toggle plan/act mode and restore prefill
+            if user_input == TUI._SHIFT_TAB_SENTINEL:
+                if agent._plan_mode:
+                    _exit_plan_mode(agent, session)
+                else:
+                    _enter_plan_mode(agent, session)
+                _typeahead_text = tui._shift_tab_prefill
+                tui._shift_tab_prefill = ""
+                continue
 
             user_input = user_input.strip()
             if not user_input:
@@ -7181,31 +7583,45 @@ def main():
 
                 # ── Plan mode commands ────────────────────────────────
                 elif cmd == "/plan":
-                    agent._plan_mode = True
-                    _c226 = _ansi(chr(27)+'[38;5;226m')
-                    _c240 = _ansi(chr(27)+'[38;5;240m')
-                    print(f"\n  {_c226}━━ Plan Mode (Phase 1: Analysis) ━━{C.RESET}")
-                    print(f"  {_c226}Read-only exploration enabled.{C.RESET}")
-                    print(f"  {_c240}Allowed: Read, Glob, Grep, WebFetch, WebSearch, Task*, SubAgent{C.RESET}")
-                    print(f"  {_c240}Blocked: Write, Edit, Bash, NotebookEdit{C.RESET}")
-                    print(f"  {_c240}/approve or /execute → switch to Act mode (Phase 2){C.RESET}")
-                    print(f"  {_c226}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.RESET}\n")
+                    parts = user_input.split(maxsplit=1)
+                    subcmd = parts[1].strip().lower() if len(parts) > 1 else ""
+                    if subcmd == "list":
+                        # List recent plan files
+                        plans_dir = os.path.join(config.cwd, ".vibe-local", "plans")
+                        if not os.path.isdir(plans_dir):
+                            print(f"{C.DIM}  No plans yet.{C.RESET}")
+                        else:
+                            md_files = sorted(
+                                [f for f in os.listdir(plans_dir) if f.endswith(".md")],
+                                key=lambda f: os.path.getmtime(os.path.join(plans_dir, f))
+                                    if os.path.isfile(os.path.join(plans_dir, f)) else 0,
+                                reverse=True,
+                            )[:10]
+                            if not md_files:
+                                print(f"{C.DIM}  No plans yet.{C.RESET}")
+                            else:
+                                _c226 = _ansi(chr(27) + '[38;5;226m')
+                                _c240 = _ansi(chr(27) + '[38;5;240m')
+                                print(f"\n  {_c226}━━ Plans (newest first) ━━{C.RESET}")
+                                for pf in md_files:
+                                    fp = os.path.join(plans_dir, pf)
+                                    try:
+                                        sz = os.path.getsize(fp)
+                                    except OSError:
+                                        sz = 0
+                                    sz_str = f"{sz:,}B" if sz < 1024 else f"{sz/1024:.1f}KB"
+                                    active = " ◀" if agent._active_plan_path and os.path.samefile(fp, agent._active_plan_path) else ""
+                                    print(f"  {_c240}{pf}  ({sz_str}){active}{C.RESET}")
+                                print()
+                    else:
+                        _enter_plan_mode(agent, session)
                     continue
 
                 elif cmd in ("/execute", "/plan-execute", "/approve", "/act"):
                     if not agent._plan_mode:
                         print(f"{C.YELLOW}Not in plan mode. Use /plan first.{C.RESET}")
                     else:
-                        agent._plan_mode = False
-                        # Auto-checkpoint before entering Act mode
-                        if agent.git_checkpoint._is_git_repo:
-                            if agent.git_checkpoint.create("plan-to-act"):
-                                print(f"  {_ansi(chr(27)+'[38;5;87m')}Git checkpoint saved (use /rollback to undo){C.RESET}")
-                        print(f"\n  {_ansi(chr(27)+'[38;5;46m')}━━ Act Mode (Phase 2: Execution) ━━{C.RESET}")
-                        print(f"  {_ansi(chr(27)+'[38;5;46m')}All tools re-enabled. Implementing plan.{C.RESET}")
-                        print(f"  {_ansi(chr(27)+'[38;5;240m')}/plan → return to read-only mode{C.RESET}")
-                        print(f"  {_ansi(chr(27)+'[38;5;240m')}/rollback → undo all changes since plan{C.RESET}")
-                        print(f"  {_ansi(chr(27)+'[38;5;46m')}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.RESET}\n")
+                        _exit_plan_mode(agent, session)
                     continue
 
                 # ── Git checkpoint & rollback ────────────────────────
@@ -7361,6 +7777,13 @@ def main():
 
             # Run agent
             agent.run(user_input)
+            # Check if Shift+Tab was pressed during agent execution
+            if agent._shift_tab_toggle:
+                agent._shift_tab_toggle = False
+                if agent._plan_mode:
+                    _exit_plan_mode(agent, session)
+                else:
+                    _enter_plan_mode(agent, session)
             # Capture type-ahead for next prompt (text typed during execution)
             _typeahead_text = agent.get_typeahead()
             if _typeahead_text:

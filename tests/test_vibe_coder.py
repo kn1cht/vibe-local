@@ -2467,7 +2467,7 @@ class TestPlanMode:
     """Plan mode restricts tools to read-only set."""
 
     def test_plan_mode_tools_set(self):
-        """PLAN_MODE_TOOLS should include read-only and task tools."""
+        """PLAN_MODE_TOOLS should include read-only, task, and plan-write tools."""
         tools = vc.Agent.PLAN_MODE_TOOLS
         assert "Read" in tools
         assert "Glob" in tools
@@ -2476,9 +2476,11 @@ class TestPlanMode:
         assert "WebSearch" in tools
         assert "TaskCreate" in tools
         assert "TaskList" in tools
+        # Write is allowed but restricted to plans/ at runtime
+        assert "Write" in tools
+        assert "AskUserQuestion" in tools
         # Side-effecting tools must NOT be in plan mode
         assert "Bash" not in tools
-        assert "Write" not in tools
         assert "Edit" not in tools
         assert "NotebookEdit" not in tools
 
@@ -7385,8 +7387,8 @@ class TestPlanActMode:
             content = f.read()
         assert "_plan_mode" in content
         assert "ACT_ONLY_TOOLS" in content
-        assert "Phase 1: Analysis" in content
-        assert "Phase 2: Execution" in content
+        assert "Plan Mode" in content
+        assert "Act Mode" in content
 
     def test_act_only_tools_defined(self):
         """ACT_ONLY_TOOLS should contain write/edit/bash tools."""
