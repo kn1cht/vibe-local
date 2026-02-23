@@ -34,6 +34,8 @@ import hashlib
 import traceback
 import base64
 import atexit
+import struct
+import sqlite3
 from abc import ABC, abstractmethod
 from datetime import datetime
 import collections
@@ -712,6 +714,13 @@ class Config:
         self.session_id = None
         self.list_sessions = False
         self.cwd = os.getcwd()
+        # RAG options
+        self.rag = False
+        self.rag_mode = "query"
+        self.rag_path = None
+        self.rag_topk = 5
+        self.rag_model = "nomic-embed-text"
+        self.rag_index = None  # path to index then exit
 
         # Paths (primary: vibe-local, with backward compat for old vibe-coder dirs)
         if os.name == "nt":
@@ -845,6 +854,17 @@ class Config:
         parser.add_argument("--version", action="version", version=f"vibe-coder {__version__}")
         parser.add_argument("--dangerously-skip-permissions", action="store_true",
                             help="Alias for -y (compatibility)")
+        # RAG options
+        parser.add_argument("--rag", action="store_true", help="Enable RAG mode")
+        parser.add_argument("--rag-mode", choices=["query", "auto"], default="query",
+                            help="RAG mode: query or auto (default: query)")
+        parser.add_argument("--rag-path", help="Path to use for RAG context")
+        parser.add_argument("--rag-topk", type=int, default=5,
+                            help="Number of top results for RAG (default: 5)")
+        parser.add_argument("--rag-model", default="nomic-embed-text",
+                            help="Ollama embedding model (default: nomic-embed-text)")
+        parser.add_argument("--rag-index", metavar="PATH",
+                            help="Index files at PATH for RAG and exit")
         args = parser.parse_args(argv)
 
         if args.prompt:
@@ -870,6 +890,19 @@ class Config:
             self.temperature = args.temperature
         if args.context_window is not None:
             self.context_window = args.context_window
+        # RAG args
+        if args.rag:
+            self.rag = True
+        if args.rag_mode:
+            self.rag_mode = args.rag_mode
+        if args.rag_path:
+            self.rag_path = args.rag_path
+        if args.rag_topk is not None:
+            self.rag_topk = args.rag_topk
+        if args.rag_model:
+            self.rag_model = args.rag_model
+        if args.rag_index:
+            self.rag_index = args.rag_index
 
     # Model-specific context window sizes
     MODEL_CONTEXT_SIZES = {
@@ -1654,6 +1687,304 @@ class OllamaClient:
             tool_calls.append({"id": tc_id, "name": name, "arguments": args})
 
         return {"content": content, "tool_calls": tool_calls}
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# RAG Engine (optional, activated by --rag / --rag-index)
+# ════════════════════════════════════════════════════════════════════════════════
+
+class RAGEngine:
+    """Local RAG engine using Ollama embeddings + SQLite vector store."""
+
+    # File extensions to index
+    TEXT_EXTENSIONS = {
+        '.py', '.js', '.ts', '.tsx', '.jsx', '.md', '.txt', '.json',
+        '.yaml', '.yml', '.toml', '.cfg', '.ini', '.sh', '.bash',
+        '.html', '.css', '.go', '.rs', '.java', '.c', '.cpp', '.h',
+        '.hpp', '.rb', '.php', '.sql', '.r', '.swift', '.kt', '.vue',
+        '.svelte', '.xml',
+    }
+    # Bare filenames (no extension) to index
+    BARE_FILENAMES = {'makefile', 'dockerfile', 'readme', 'license'}
+    # Directories to skip
+    SKIP_DIRS = {
+        '.git', '.svn', '.hg', 'node_modules', '__pycache__',
+        'venv', '.venv', 'dist', 'build', '.vibe', '.tox', '.mypy_cache',
+    }
+    # Max file size to index (256 KB)
+    MAX_FILE_SIZE = 256 * 1024
+
+    def __init__(self, config):
+        self.config = config
+        self.db_path = os.path.join(config.cwd, ".vibe", "rag", "index.sqlite")
+        self._ensure_db()
+
+    def _ensure_db(self):
+        """Create SQLite database and tables if needed."""
+        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("""CREATE TABLE IF NOT EXISTS documents (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            path TEXT NOT NULL,
+            chunk_index INTEGER NOT NULL,
+            content TEXT NOT NULL,
+            embedding BLOB NOT NULL,
+            file_hash TEXT NOT NULL,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(path, chunk_index)
+        )""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_doc_path ON documents(path)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_doc_hash ON documents(file_hash)")
+        conn.commit()
+        conn.close()
+
+    # ── Embedding ─────────────────────────────────────────────────────────────
+
+    def _get_embedding(self, text):
+        """Get embedding vector from Ollama. Tries /api/embed first, falls back to /api/embeddings."""
+        model = self.config.rag_model
+        host = self.config.ollama_host.rstrip("/")
+
+        # Try /api/embed (Ollama ≥ 0.4)
+        try:
+            url = f"{host}/api/embed"
+            payload = json.dumps({"model": model, "input": text}).encode("utf-8")
+            req = urllib.request.Request(url, data=payload,
+                                        headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                data = json.loads(resp.read())
+                return data["embeddings"][0]
+        except Exception:
+            pass
+
+        # Fallback: /api/embeddings (older Ollama)
+        url = f"{host}/api/embeddings"
+        payload = json.dumps({"model": model, "prompt": text}).encode("utf-8")
+        req = urllib.request.Request(url, data=payload,
+                                    headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read())
+            return data["embedding"]
+
+    # ── Vector serialization ──────────────────────────────────────────────────
+
+    @staticmethod
+    def _serialize_embedding(vec):
+        """Serialize float list to compact binary BLOB."""
+        return struct.pack(f'{len(vec)}f', *vec)
+
+    @staticmethod
+    def _deserialize_embedding(blob):
+        """Deserialize BLOB back to float tuple."""
+        n = len(blob) // 4  # float32 = 4 bytes
+        return struct.unpack(f'{n}f', blob)
+
+    # ── Similarity ────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _cosine_similarity(a, b):
+        """Compute cosine similarity between two vectors."""
+        dot = sum(x * y for x, y in zip(a, b))
+        norm_a = sum(x * x for x in a) ** 0.5
+        norm_b = sum(x * x for x in b) ** 0.5
+        if norm_a == 0 or norm_b == 0:
+            return 0.0
+        return dot / (norm_a * norm_b)
+
+    # ── Chunking ──────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _chunk_text(text, chunk_size=1000, overlap=200):
+        """Split text into overlapping chunks at line boundaries."""
+        lines = text.split('\n')
+        chunks = []
+        current = []
+        current_len = 0
+
+        for line in lines:
+            line_len = len(line) + 1
+            if current_len + line_len > chunk_size and current:
+                chunks.append('\n'.join(current))
+                # Keep overlap portion
+                overlap_lines = []
+                overlap_len = 0
+                for prev in reversed(current):
+                    if overlap_len + len(prev) + 1 > overlap:
+                        break
+                    overlap_lines.insert(0, prev)
+                    overlap_len += len(prev) + 1
+                current = overlap_lines
+                current_len = overlap_len
+            current.append(line)
+            current_len += line_len
+
+        if current:
+            chunks.append('\n'.join(current))
+
+        return chunks if chunks else [text]
+
+    # ── File hash ─────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _file_hash(path):
+        """Compute SHA-256 hash of a file."""
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for block in iter(lambda: f.read(8192), b""):
+                h.update(block)
+        return h.hexdigest()
+
+    # ── Indexing ──────────────────────────────────────────────────────────────
+
+    def _collect_files(self, target):
+        """Collect indexable files under target path."""
+        target = os.path.abspath(target)
+        if os.path.isfile(target):
+            return [target]
+
+        files = []
+        for root, dirs, filenames in os.walk(target):
+            dirs[:] = [d for d in dirs if d not in self.SKIP_DIRS and not d.startswith('.')]
+            for fname in filenames:
+                fpath = os.path.join(root, fname)
+                try:
+                    if os.path.getsize(fpath) > self.MAX_FILE_SIZE:
+                        continue
+                except OSError:
+                    continue
+                ext = os.path.splitext(fname)[1].lower()
+                if ext in self.TEXT_EXTENSIONS or fname.lower() in self.BARE_FILENAMES:
+                    files.append(fpath)
+        return files
+
+    def index_path(self, target_path, verbose=True):
+        """Index all text files under target_path. Returns (indexed, skipped, errors)."""
+        target = os.path.abspath(target_path)
+        if not os.path.exists(target):
+            if verbose:
+                print(f"{C.RED}Error: path '{target_path}' does not exist{C.RESET}")
+            return 0, 0, 1
+
+        files = self._collect_files(target)
+        if not files:
+            if verbose:
+                print(f"{C.YELLOW}No indexable files found in '{target_path}'{C.RESET}")
+            return 0, 0, 0
+
+        conn = sqlite3.connect(self.db_path)
+        indexed, skipped, errors = 0, 0, 0
+
+        for fpath in files:
+            rel_path = os.path.relpath(fpath, self.config.cwd)
+            try:
+                fhash = self._file_hash(fpath)
+
+                # Skip if already indexed with same hash
+                row = conn.execute(
+                    "SELECT file_hash FROM documents WHERE path = ? LIMIT 1",
+                    (rel_path,),
+                ).fetchone()
+                if row and row[0] == fhash:
+                    skipped += 1
+                    continue
+
+                # Remove stale entries
+                conn.execute("DELETE FROM documents WHERE path = ?", (rel_path,))
+
+                with open(fpath, "r", errors="replace") as f:
+                    content = f.read()
+                if not content.strip():
+                    skipped += 1
+                    continue
+
+                chunks = self._chunk_text(content)
+                for i, chunk in enumerate(chunks):
+                    if not chunk.strip():
+                        continue
+                    embedding = self._get_embedding(chunk)
+                    emb_blob = self._serialize_embedding(embedding)
+                    conn.execute(
+                        "INSERT OR REPLACE INTO documents "
+                        "(path, chunk_index, content, embedding, file_hash) "
+                        "VALUES (?, ?, ?, ?, ?)",
+                        (rel_path, i, chunk, emb_blob, fhash),
+                    )
+
+                conn.commit()
+                indexed += 1
+                if verbose:
+                    print(f"  {C.GREEN}✓{C.RESET} {rel_path} ({len(chunks)} chunks)")
+
+            except Exception as e:
+                errors += 1
+                if verbose:
+                    print(f"  {C.RED}✗{C.RESET} {rel_path}: {e}")
+
+        conn.commit()
+        conn.close()
+
+        if verbose:
+            print(f"\n{C.GREEN}Indexing complete:{C.RESET} "
+                  f"{indexed} files indexed, {skipped} unchanged, {errors} errors")
+            db_size = os.path.getsize(self.db_path)
+            print(f"{C.DIM}Database: {self.db_path} ({db_size // 1024} KB){C.RESET}")
+
+        return indexed, skipped, errors
+
+    # ── Query ─────────────────────────────────────────────────────────────────
+
+    def query(self, query_text, top_k=None):
+        """Query the index. Returns list of (path, content, similarity)."""
+        if top_k is None:
+            top_k = self.config.rag_topk
+
+        if not os.path.exists(self.db_path):
+            return []
+
+        query_emb = self._get_embedding(query_text)
+
+        conn = sqlite3.connect(self.db_path)
+        rows = conn.execute(
+            "SELECT path, content, embedding FROM documents"
+        ).fetchall()
+        conn.close()
+
+        if not rows:
+            return []
+
+        results = []
+        for path, content, emb_blob in rows:
+            emb = self._deserialize_embedding(emb_blob)
+            sim = self._cosine_similarity(query_emb, emb)
+            results.append((sim, path, content))
+
+        results.sort(key=lambda x: x[0], reverse=True)
+        return [(path, content, sim) for sim, path, content in results[:top_k]]
+
+    def format_context(self, results):
+        """Format query results as context block for system prompt injection."""
+        if not results:
+            return ""
+        lines = ["[LOCAL CONTEXT START]"]
+        for path, content, sim in results:
+            lines.append(f"--- {path} (relevance: {sim:.3f}) ---")
+            # Truncate very long chunks
+            if len(content) > 2000:
+                content = content[:2000] + "\n... (truncated)"
+            lines.append(content)
+        lines.append("[LOCAL CONTEXT END]")
+        return "\n".join(lines)
+
+    def get_stats(self):
+        """Return index statistics."""
+        if not os.path.exists(self.db_path):
+            return {"chunks": 0, "files": 0, "db_size": 0}
+        conn = sqlite3.connect(self.db_path)
+        chunks = conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
+        files = conn.execute("SELECT COUNT(DISTINCT path) FROM documents").fetchone()[0]
+        conn.close()
+        db_size = os.path.getsize(self.db_path)
+        return {"chunks": chunks, "files": files, "db_size": db_size}
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -6135,13 +6466,15 @@ class Agent:
     # Tools allowed in act mode only (write/modify tools)
     ACT_ONLY_TOOLS = {"Bash", "Write", "Edit", "NotebookEdit"}
 
-    def __init__(self, config, client, registry, permissions, session, tui):
+    def __init__(self, config, client, registry, permissions, session, tui,
+                 rag_engine=None):
         self.config = config
         self.client = client
         self.registry = registry
         self.permissions = permissions
         self.session = session
         self.tui = tui
+        self.rag_engine = rag_engine
         self._interrupted = threading.Event()
         self._tui_lock = threading.Lock()
         self._plan_mode = False
@@ -6200,6 +6533,19 @@ class Agent:
                     _p()
                     return
 
+        # RAG: inject relevant context before the user message
+        if self.rag_engine and self.config.rag:
+            try:
+                results = self.rag_engine.query(user_input)
+                if results:
+                    ctx = self.rag_engine.format_context(results)
+                    self.session.add_system_note(ctx)
+                    if self.config.debug:
+                        print(f"{C.DIM}[debug] RAG: injected {len(results)} chunks{C.RESET}",
+                              file=sys.stderr)
+            except Exception as e:
+                if self.config.debug:
+                    print(f"{C.DIM}[debug] RAG query failed: {e}{C.RESET}", file=sys.stderr)
         self.session.add_user_message(user_input)
         self._interrupted.clear()
         _recent_tool_calls = []  # track recent calls for loop detection
@@ -6758,6 +7104,21 @@ def main():
             print(f"{s['id']:<20} {s['modified']:<18} {s['messages']:<10} {s['size']:<10}")
         return
 
+    # Handle --rag-index (index files and exit)
+    if config.rag_index:
+        print(f"\n{C.CYAN}RAG Indexing: {config.rag_index}{C.RESET}")
+        print(f"{C.DIM}Embedding model: {config.rag_model}{C.RESET}")
+        print(f"{C.DIM}Ollama: {config.ollama_host}{C.RESET}\n")
+        try:
+            rag = RAGEngine(config)
+            rag.index_path(config.rag_index)
+        except Exception as e:
+            print(f"{C.RED}RAG indexing failed: {e}{C.RESET}")
+            if config.debug:
+                traceback.print_exc()
+            sys.exit(1)
+        return
+
     # Show banner immediately so user sees output while connecting
     tui = TUI(config)
     if not config.prompt:
@@ -6854,6 +7215,24 @@ def main():
         if config.debug:
             print(f"{C.DIM}[debug] Loaded {len(skills)} skills: {', '.join(skills.keys())}{C.RESET}", file=sys.stderr)
 
+    # RAG: inject local context into system prompt (query mode)
+    _rag_engine = None
+    if config.rag:
+        try:
+            _rag_engine = RAGEngine(config)
+            stats = _rag_engine.get_stats()
+            if stats["chunks"] > 0:
+                print(f"{C.CYAN}RAG enabled:{C.RESET} {stats['files']} files, "
+                      f"{stats['chunks']} chunks indexed "
+                      f"({stats['db_size'] // 1024} KB)")
+            else:
+                rag_path = config.rag_path or config.cwd
+                print(f"{C.YELLOW}RAG: No index found. Run indexing first:{C.RESET}")
+                print(f"{C.DIM}  python3 vibe-coder.py --rag-index {rag_path}{C.RESET}")
+        except Exception as e:
+            print(f"{C.YELLOW}RAG initialization warning: {e}{C.RESET}")
+            _rag_engine = None
+
     session = Session(config, system_prompt)
     session.set_client(client)  # enable sidecar model for context compaction
     registry = ToolRegistry().register_defaults()
@@ -6887,7 +7266,8 @@ def main():
         except Exception as e:
             print(f"{C.YELLOW}Warning: MCP server '{srv_name}' failed: {e}{C.RESET}", file=sys.stderr)
 
-    agent = Agent(config, client, registry, permissions, session, tui)
+    agent = Agent(config, client, registry, permissions, session, tui,
+                  rag_engine=_rag_engine)
 
     # Handle Ctrl+C gracefully
     def signal_handler(sig, frame):

@@ -9629,4 +9629,334 @@ class TestWriteRestrictionGuardBehavior:
             assert self._is_write_allowed_in_plan_mode(plans_dir, td) is False
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# RAG Engine
+# ═══════════════════════════════════════════════════════════════════════════
 
+class TestRAGConfig:
+    """Tests for RAG-related Config options."""
+
+    def test_rag_defaults(self):
+        cfg = vc.Config()
+        assert cfg.rag is False
+        assert cfg.rag_mode == "query"
+        assert cfg.rag_path is None
+        assert cfg.rag_topk == 5
+        assert cfg.rag_model == "nomic-embed-text"
+        assert cfg.rag_index is None
+
+    def test_rag_cli_args(self):
+        cfg = vc.Config()
+        cfg._load_cli_args([
+            "--rag", "--rag-mode", "query",
+            "--rag-path", "./docs", "--rag-topk", "3",
+            "--rag-model", "bge-small",
+        ])
+        assert cfg.rag is True
+        assert cfg.rag_mode == "query"
+        assert cfg.rag_path == "./docs"
+        assert cfg.rag_topk == 3
+        assert cfg.rag_model == "bge-small"
+
+    def test_rag_index_cli_arg(self):
+        cfg = vc.Config()
+        cfg._load_cli_args(["--rag-index", "/tmp/my-docs"])
+        assert cfg.rag_index == "/tmp/my-docs"
+
+    def test_rag_disabled_by_default_no_side_effects(self):
+        """When --rag is not set, no RAG attributes should affect normal flow."""
+        cfg = vc.Config()
+        cfg._load_cli_args(["-p", "hello"])
+        assert cfg.rag is False
+        assert cfg.prompt == "hello"
+
+
+class TestRAGEngineStatic:
+    """Tests for RAGEngine static/pure methods (no Ollama needed)."""
+
+    def test_chunk_text_basic(self):
+        text = "line1\nline2\nline3\nline4\nline5"
+        chunks = vc.RAGEngine._chunk_text(text, chunk_size=15, overlap=5)
+        assert len(chunks) >= 2
+        # All original content should be present across chunks
+        joined = "\n".join(chunks)
+        for line in ["line1", "line2", "line3", "line4", "line5"]:
+            assert line in joined
+
+    def test_chunk_text_single_short(self):
+        text = "short"
+        chunks = vc.RAGEngine._chunk_text(text, chunk_size=1000, overlap=200)
+        assert len(chunks) == 1
+        assert chunks[0] == "short"
+
+    def test_chunk_text_empty(self):
+        chunks = vc.RAGEngine._chunk_text("", chunk_size=1000, overlap=200)
+        assert len(chunks) == 1
+
+    def test_chunk_text_overlap_preserved(self):
+        """Chunks should overlap so no content is lost at boundaries."""
+        lines = [f"line{i}" for i in range(20)]
+        text = "\n".join(lines)
+        chunks = vc.RAGEngine._chunk_text(text, chunk_size=30, overlap=10)
+        assert len(chunks) >= 3
+        # Verify overlap: last lines of chunk N appear in chunk N+1
+        for i in range(len(chunks) - 1):
+            last_lines = chunks[i].split("\n")[-2:]
+            next_chunk = chunks[i + 1]
+            overlap_found = any(line in next_chunk for line in last_lines if line)
+            assert overlap_found, f"No overlap between chunk {i} and {i+1}"
+
+    def test_cosine_similarity_identical(self):
+        a = [1.0, 2.0, 3.0]
+        assert abs(vc.RAGEngine._cosine_similarity(a, a) - 1.0) < 1e-6
+
+    def test_cosine_similarity_orthogonal(self):
+        a = [1.0, 0.0, 0.0]
+        b = [0.0, 1.0, 0.0]
+        assert abs(vc.RAGEngine._cosine_similarity(a, b)) < 1e-6
+
+    def test_cosine_similarity_opposite(self):
+        a = [1.0, 0.0]
+        b = [-1.0, 0.0]
+        assert abs(vc.RAGEngine._cosine_similarity(a, b) - (-1.0)) < 1e-6
+
+    def test_cosine_similarity_zero_vector(self):
+        a = [0.0, 0.0, 0.0]
+        b = [1.0, 2.0, 3.0]
+        assert vc.RAGEngine._cosine_similarity(a, b) == 0.0
+
+    def test_embedding_serialization_roundtrip(self):
+        vec = [0.1, -0.2, 0.3, 0.0, 1.0, -1.0]
+        blob = vc.RAGEngine._serialize_embedding(vec)
+        assert isinstance(blob, bytes)
+        recovered = vc.RAGEngine._deserialize_embedding(blob)
+        assert len(recovered) == len(vec)
+        for orig, rec in zip(vec, recovered):
+            assert abs(orig - rec) < 1e-6
+
+    def test_embedding_serialization_large(self):
+        """Test with realistic embedding dimension (768)."""
+        import random
+        random.seed(42)
+        vec = [random.uniform(-1, 1) for _ in range(768)]
+        blob = vc.RAGEngine._serialize_embedding(vec)
+        assert len(blob) == 768 * 4  # float32
+        recovered = vc.RAGEngine._deserialize_embedding(blob)
+        for orig, rec in zip(vec, recovered):
+            assert abs(orig - rec) < 1e-5
+
+    def test_file_hash_deterministic(self):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+            f.write("hello world")
+            f.flush()
+            path = f.name
+        try:
+            h1 = vc.RAGEngine._file_hash(path)
+            h2 = vc.RAGEngine._file_hash(path)
+            assert h1 == h2
+            assert len(h1) == 64
+        finally:
+            os.unlink(path)
+
+    def test_file_hash_changes_on_content_change(self):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+            f.write("version1")
+            f.flush()
+            path = f.name
+        try:
+            h1 = vc.RAGEngine._file_hash(path)
+            with open(path, "w") as f2:
+                f2.write("version2")
+            h2 = vc.RAGEngine._file_hash(path)
+            assert h1 != h2
+        finally:
+            os.unlink(path)
+
+
+class TestRAGEngineIntegration:
+    """Integration tests for RAGEngine with mocked Ollama embeddings."""
+
+    @pytest.fixture
+    def rag_env(self, tmp_path):
+        """Set up a RAGEngine with mocked embedding function."""
+        cfg = vc.Config()
+        cfg.cwd = str(tmp_path)
+        cfg.rag = True
+        cfg.rag_topk = 3
+        cfg.rag_model = "nomic-embed-text"
+        cfg.ollama_host = "http://localhost:11434"
+
+        rag = vc.RAGEngine(cfg)
+
+        # Mock _get_embedding: simple bag-of-words vector for testing
+        _vocab = {}
+        _dim = 32
+
+        def _mock_embedding(text):
+            """Deterministic mock embedding based on word hashing."""
+            import hashlib as _hl
+            vec = [0.0] * _dim
+            for word in text.lower().split():
+                h = int(_hl.md5(word.encode()).hexdigest(), 16)
+                idx = h % _dim
+                vec[idx] += 1.0
+            # Normalize
+            norm = sum(x * x for x in vec) ** 0.5
+            if norm > 0:
+                vec = [x / norm for x in vec]
+            return vec
+
+        rag._get_embedding = _mock_embedding
+        return rag, cfg, tmp_path
+
+    def test_db_creation(self, rag_env):
+        rag, cfg, tmp_path = rag_env
+        assert os.path.exists(rag.db_path)
+        stats = rag.get_stats()
+        assert stats["chunks"] == 0
+        assert stats["files"] == 0
+
+    def test_index_single_file(self, rag_env):
+        rag, cfg, tmp_path = rag_env
+        # Create a test file
+        doc = tmp_path / "test.py"
+        doc.write_text("def hello():\n    print('hello world')\n")
+
+        indexed, skipped, errors = rag.index_path(str(doc), verbose=False)
+        assert indexed == 1
+        assert errors == 0
+
+        stats = rag.get_stats()
+        assert stats["files"] == 1
+        assert stats["chunks"] >= 1
+
+    def test_index_directory(self, rag_env):
+        rag, cfg, tmp_path = rag_env
+        docs_dir = tmp_path / "docs"
+        docs_dir.mkdir()
+        (docs_dir / "readme.md").write_text("# Project\nThis is a readme.")
+        (docs_dir / "main.py").write_text("import os\nprint(os.getcwd())")
+        (docs_dir / "data.bin").write_bytes(b"\x00\x01\x02")  # should be skipped
+
+        indexed, skipped, errors = rag.index_path(str(docs_dir), verbose=False)
+        assert indexed == 2  # .md and .py, not .bin
+        assert errors == 0
+
+    def test_index_skips_unchanged_files(self, rag_env):
+        rag, cfg, tmp_path = rag_env
+        doc = tmp_path / "test.py"
+        doc.write_text("x = 1")
+
+        i1, s1, e1 = rag.index_path(str(doc), verbose=False)
+        assert i1 == 1
+        assert s1 == 0
+
+        # Re-index same file -> should skip
+        i2, s2, e2 = rag.index_path(str(doc), verbose=False)
+        assert i2 == 0
+        assert s2 == 1
+
+    def test_index_reindexes_changed_files(self, rag_env):
+        rag, cfg, tmp_path = rag_env
+        doc = tmp_path / "test.py"
+        doc.write_text("x = 1")
+
+        rag.index_path(str(doc), verbose=False)
+        stats1 = rag.get_stats()
+
+        # Modify file
+        doc.write_text("x = 1\ny = 2\nz = 3")
+        i2, s2, e2 = rag.index_path(str(doc), verbose=False)
+        assert i2 == 1  # re-indexed
+        assert s2 == 0
+
+    def test_index_skips_hidden_and_node_modules(self, rag_env):
+        rag, cfg, tmp_path = rag_env
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "app.py").write_text("print('app')")
+        nm = tmp_path / "node_modules"
+        nm.mkdir()
+        (nm / "dep.js").write_text("module.exports = {}")
+        hidden = tmp_path / ".secret"
+        hidden.mkdir()
+        (hidden / "key.txt").write_text("secret123")
+
+        indexed, _, _ = rag.index_path(str(tmp_path), verbose=False)
+        assert indexed == 1  # only src/app.py
+
+    def test_index_nonexistent_path(self, rag_env):
+        rag, cfg, tmp_path = rag_env
+        indexed, skipped, errors = rag.index_path("/nonexistent/path", verbose=False)
+        assert errors == 1
+
+    def test_query_returns_relevant_results(self, rag_env):
+        rag, cfg, tmp_path = rag_env
+        # Index files with distinct content
+        (tmp_path / "auth.py").write_text(
+            "def login(user, password):\n    authenticate user credentials\n"
+        )
+        (tmp_path / "math.py").write_text(
+            "def calculate(x, y):\n    return x + y\n"
+        )
+        (tmp_path / "network.py").write_text(
+            "def fetch(url):\n    download data from network\n"
+        )
+        rag.index_path(str(tmp_path), verbose=False)
+
+        results = rag.query("login authentication user", top_k=2)
+        assert len(results) <= 2
+        assert len(results) >= 1
+        # The auth file should be most relevant
+        paths = [r[0] for r in results]
+        assert any("auth" in p for p in paths)
+
+    def test_query_empty_index(self, rag_env):
+        rag, cfg, tmp_path = rag_env
+        results = rag.query("anything")
+        assert results == []
+
+    def test_query_respects_topk(self, rag_env):
+        rag, cfg, tmp_path = rag_env
+        for i in range(10):
+            (tmp_path / f"file{i}.py").write_text(f"content {i}\n")
+        rag.index_path(str(tmp_path), verbose=False)
+
+        results = rag.query("content", top_k=3)
+        assert len(results) <= 3
+
+    def test_format_context_with_results(self, rag_env):
+        rag, cfg, tmp_path = rag_env
+        results = [
+            ("file1.py", "def foo(): pass", 0.95),
+            ("file2.py", "def bar(): pass", 0.80),
+        ]
+        ctx = rag.format_context(results)
+        assert "[LOCAL CONTEXT START]" in ctx
+        assert "[LOCAL CONTEXT END]" in ctx
+        assert "file1.py" in ctx
+        assert "0.950" in ctx
+        assert "def foo(): pass" in ctx
+
+    def test_format_context_empty(self, rag_env):
+        rag, cfg, tmp_path = rag_env
+        assert rag.format_context([]) == ""
+
+    def test_format_context_truncates_long_content(self, rag_env):
+        rag, cfg, tmp_path = rag_env
+        long_content = "x" * 5000
+        results = [("big.py", long_content, 0.9)]
+        ctx = rag.format_context(results)
+        assert "truncated" in ctx
+        assert len(ctx) < 5000
+
+    def test_get_stats(self, rag_env):
+        rag, cfg, tmp_path = rag_env
+        (tmp_path / "a.py").write_text("hello")
+        (tmp_path / "b.py").write_text("world")
+        rag.index_path(str(tmp_path), verbose=False)
+
+        stats = rag.get_stats()
+        assert stats["files"] == 2
+        assert stats["chunks"] >= 2
+        assert stats["db_size"] > 0
