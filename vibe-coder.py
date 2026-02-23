@@ -64,7 +64,7 @@ _bg_task_counter = [0]
 _bg_tasks_lock = threading.Lock()
 MAX_BG_TASKS = 50  # Prevent unbounded memory growth
 
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ANSI Colors
@@ -167,10 +167,14 @@ def _truncate_to_display_width(text, max_width):
 # ════════════════════════════════════════════════════════════════════════════════
 
 class InputMonitor:
-    """Detect ESC key press during agent execution using cbreak mode.
+    """Detect ESC key press and capture type-ahead during agent execution.
 
     Unix-only: uses termios + tty.setcbreak for real-time key detection.
     On Windows (or when termios is unavailable), all methods are no-ops.
+
+    Type-ahead: any non-ESC characters typed during agent execution are
+    buffered and can be injected into readline's next input() call via
+    get_typeahead() + readline.set_startup_hook.
     """
 
     def __init__(self):
@@ -178,11 +182,25 @@ class InputMonitor:
         self._stop_event = threading.Event()
         self._thread = None
         self._old_settings = None
+        self._typeahead = []      # buffered keystrokes (bytes)
+        self._typeahead_lock = threading.Lock()
 
     @property
     def pressed(self):
         """True if ESC was pressed since start()."""
         return self._pressed.is_set()
+
+    def get_typeahead(self):
+        """Return and clear any buffered type-ahead text (decoded as utf-8)."""
+        with self._typeahead_lock:
+            if not self._typeahead:
+                return ""
+            raw = b"".join(self._typeahead)
+            self._typeahead.clear()
+        try:
+            return raw.decode("utf-8", errors="replace")
+        except Exception:
+            return ""
 
     def start(self):
         """Begin monitoring stdin for ESC key in a daemon thread."""
@@ -190,6 +208,8 @@ class InputMonitor:
             return
         self._pressed.clear()
         self._stop_event.clear()
+        with self._typeahead_lock:
+            self._typeahead.clear()
         try:
             self._old_settings = termios.tcgetattr(sys.stdin)
         except termios.error:
@@ -203,7 +223,7 @@ class InputMonitor:
         self._thread.start()
 
     def _poll(self):
-        """Poll stdin for ESC (0x1b) with 0.2s timeout."""
+        """Poll stdin for ESC (0x1b) with 0.2s timeout. Non-ESC chars are buffered."""
         fd = sys.stdin.fileno()
         while not self._stop_event.is_set():
             try:
@@ -218,6 +238,21 @@ class InputMonitor:
                 if ch == b'\x1b':
                     self._pressed.set()
                     break
+                elif ch == b'\x03':  # Ctrl+C
+                    self._pressed.set()
+                    break
+                elif ch == b'\n' or ch == b'\r':
+                    # Enter during execution — ignore (don't buffer newlines)
+                    pass
+                elif ch == b'\x7f' or ch == b'\x08':
+                    # Backspace — remove last buffered char
+                    with self._typeahead_lock:
+                        if self._typeahead:
+                            self._typeahead.pop()
+                else:
+                    # Buffer for type-ahead
+                    with self._typeahead_lock:
+                        self._typeahead.append(ch)
 
     def stop(self):
         """Stop monitoring and restore terminal settings."""
@@ -2575,7 +2610,7 @@ class WebSearchTool(Tool):
         links = [(u1 or u2, title) for u1, u2, title in raw_links]
 
         for i, (raw_url, raw_title) in enumerate(links[:max_results + 5]):
-            title = re.sub(r"<[^>]+>", "", raw_title).strip()
+            title = html_module.unescape(re.sub(r"<[^>]+>", "", raw_title)).strip()
             if not title:
                 continue
 
@@ -2593,7 +2628,7 @@ class WebSearchTool(Tool):
 
             snippet = ""
             if i < len(snippets):
-                snippet = re.sub(r"<[^>]+>", "", snippets[i]).strip()
+                snippet = html_module.unescape(re.sub(r"<[^>]+>", "", snippets[i])).strip()
 
             results.append({"title": title, "url": url, "snippet": snippet})
             if len(results) >= max_results:
@@ -4877,11 +4912,14 @@ class TUI:
                 print(f"  {C.DIM}   Or type /yes during session to enable{C.RESET}")
         # Detect CJK for appropriate hint
         _hint = _ansi("\033[38;5;250m")  # lighter gray for better visibility
+        _esc_hint = "ESC/Ctrl+C 中断" if HAS_TERMIOS else "Ctrl+C 中断"
+        _esc_hint_en = "ESC or Ctrl+C to interrupt" if HAS_TERMIOS else "Ctrl+C to interrupt"
         if self._is_cjk:
-            print(f"  {_hint}/help コマンド一覧 • Ctrl+C 中断 (2回で終了) • \"\"\"で複数行{C.RESET}")
-            print(f"  {_hint}IME対応: 空行Enterで送信{C.RESET}\n")
+            print(f"  {_hint}/help コマンド一覧 • {_esc_hint} (2回で終了) • \"\"\"で複数行{C.RESET}")
+            print(f"  {_hint}IME対応: 空行Enterで送信 • 実行中の入力はtype-ahead{C.RESET}\n")
         else:
-            print(f"  {_hint}/help commands • Ctrl+C to interrupt (press twice to quit) • \"\"\" for multiline{C.RESET}\n")
+            print(f"  {_hint}/help commands • {_esc_hint_en} (press twice to quit) • \"\"\" for multiline{C.RESET}")
+            print(f"  {_hint}Type during execution for type-ahead{C.RESET}\n")
 
     def _detect_cjk_locale(self):
         """Detect if user is likely using CJK input (IME)."""
@@ -4899,11 +4937,29 @@ class TUI:
         cjk_prefixes = ("ja", "zh", "ko", "ja_JP", "zh_CN", "zh_TW", "ko_KR")
         return any(lang.startswith(p) for p in cjk_prefixes)
 
-    def get_input(self, session=None, plan_mode=False):
+    def show_input_separator(self):
+        """Print a subtle separator line before the input prompt.
+        Visually delineates the input area from agent output above."""
+        if not self.is_interactive:
+            return
+        # Thin separator: dim dotted line, adapts to terminal width
+        sep_w = min(60, _get_terminal_width() - 4)
+        print(f"{C.DIM}{'·' * sep_w}{C.RESET}")
+
+    def get_input(self, session=None, plan_mode=False, prefill=""):
         """Get user input with readline support. Returns None on EOF/exit.
         IME-safe: in CJK locales, waits for a brief pause after Enter
-        to avoid sending during kanji conversion."""
+        to avoid sending during kanji conversion.
+        prefill: pre-populate the input line (type-ahead from agent execution).
+        """
         try:
+            # Inject type-ahead text via readline startup hook
+            if prefill and HAS_READLINE:
+                def _hook():
+                    readline.insert_text(prefill)
+                    readline.redisplay()
+                readline.set_startup_hook(_hook)
+
             # Plan mode indicator — use _rl_ansi for readline-safe ANSI in prompts
             _rl_reset = _rl_ansi(C.RESET if C._enabled else "")
             plan_tag = f"{_rl_ansi(chr(27)+'[38;5;226m')}[PLAN]{_rl_reset} " if plan_mode else ""
@@ -4924,15 +4980,20 @@ class TUI:
         except (EOFError, KeyboardInterrupt):
             print()
             return None
+        finally:
+            # Always clear the startup hook after use
+            if HAS_READLINE:
+                readline.set_startup_hook()
 
-    def get_multiline_input(self, session=None, plan_mode=False):
+    def get_multiline_input(self, session=None, plan_mode=False, prefill=""):
         """Get potentially multi-line input.
         Supports:
         - \"\"\" for explicit multi-line mode
         - Empty line (Enter on blank) to submit in CJK/IME mode
         - Single Enter to submit in non-CJK mode
+        prefill: pre-populate the input line with type-ahead text.
         """
-        first_line = self.get_input(session=session, plan_mode=plan_mode)
+        first_line = self.get_input(session=session, plan_mode=plan_mode, prefill=prefill)
         if first_line is None:
             return None
         if first_line.strip() == '"""':
@@ -6031,7 +6092,14 @@ class Agent:
             print(f"{C.DIM}or type /compact to free up context and continue.{C.RESET}")
 
         # Always stop ESC monitor and restore terminal
+        self._last_typeahead = _esc_monitor.get_typeahead()
         _esc_monitor.stop()
+
+    def get_typeahead(self):
+        """Return and clear any type-ahead text captured during last run()."""
+        ta = getattr(self, "_last_typeahead", "")
+        self._last_typeahead = ""
+        return ta
 
     def interrupt(self):
         self._interrupted.set()
@@ -6277,10 +6345,15 @@ def main():
     _last_ctrl_c = [0.0]  # mutable container for closure
     _session_start_time = time.time()
     _session_start_msgs = len(session.messages)
+    _typeahead_text = ""   # type-ahead buffer from previous agent run
 
     while True:
         try:
-            user_input = tui.get_multiline_input(session=session, plan_mode=agent._plan_mode)
+            user_input = tui.get_multiline_input(
+                session=session, plan_mode=agent._plan_mode,
+                prefill=_typeahead_text,
+            )
+            _typeahead_text = ""  # consumed
             if user_input is None:
                 break
 
@@ -6806,6 +6879,10 @@ def main():
 
             # Run agent
             agent.run(user_input)
+            # Capture type-ahead for next prompt (text typed during execution)
+            _typeahead_text = agent.get_typeahead()
+            if _typeahead_text:
+                print(f"  {_ansi(chr(27)+'[38;5;240m')}(type-ahead: \"{_typeahead_text}\"){C.RESET}")
             # Auto-save after each interaction (user's work is never lost)
             session.save()
 

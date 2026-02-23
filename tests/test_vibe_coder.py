@@ -4859,7 +4859,7 @@ class TestTokenUsageDisplay:
 
     def test_version_bump(self):
         """Verify version was bumped for this feature release."""
-        assert vc.__version__ == "1.3.0"
+        assert vc.__version__ == "1.3.1"
 
     def test_bash_tool_has_run_in_background_param(self):
         tool = vc.BashTool()
@@ -8254,3 +8254,98 @@ class TestToolStatusSpinner:
         tui.is_interactive = False
         tui.start_tool_status("Bash")
         assert tui._spinner_thread is None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Type-ahead & Input UX tests
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestTypeAhead:
+    """Tests for InputMonitor type-ahead capture and readline injection."""
+
+    def test_typeahead_initially_empty(self):
+        """get_typeahead() returns empty string before start()."""
+        mon = vc.InputMonitor()
+        assert mon.get_typeahead() == ""
+
+    def test_typeahead_buffer_exists(self):
+        """InputMonitor should have a _typeahead list attribute."""
+        mon = vc.InputMonitor()
+        assert hasattr(mon, "_typeahead")
+        assert isinstance(mon._typeahead, list)
+
+    def test_typeahead_lock_exists(self):
+        """InputMonitor should have a _typeahead_lock for thread safety."""
+        mon = vc.InputMonitor()
+        assert hasattr(mon, "_typeahead_lock")
+
+    def test_typeahead_cleared_on_start(self):
+        """start() should clear any existing type-ahead buffer."""
+        mon = vc.InputMonitor()
+        mon._typeahead = [b'h', b'e', b'l', b'l', b'o']
+        result = mon.get_typeahead()
+        assert result == "hello"
+        assert mon._typeahead == []
+
+    def test_typeahead_returns_and_clears(self):
+        """get_typeahead() should return accumulated text and clear buffer."""
+        mon = vc.InputMonitor()
+        mon._typeahead = [b'h', b'i']
+        result = mon.get_typeahead()
+        assert result == "hi"
+        assert mon._typeahead == []
+        # Second call returns empty
+        assert mon.get_typeahead() == ""
+
+    def test_typeahead_utf8_decode(self):
+        """Type-ahead should properly decode multi-byte UTF-8."""
+        mon = vc.InputMonitor()
+        # "あ" in UTF-8 is \xe3\x81\x82
+        mon._typeahead = [b'\xe3', b'\x81', b'\x82']
+        result = mon.get_typeahead()
+        assert result == "あ"
+
+    def test_agent_has_get_typeahead(self):
+        """Agent class should have get_typeahead() method."""
+        assert hasattr(vc.Agent, "get_typeahead")
+        assert callable(getattr(vc.Agent, "get_typeahead"))
+
+
+class TestGetInputPrefill:
+    """Tests for TUI.get_input prefill parameter."""
+
+    def test_get_input_accepts_prefill(self):
+        """get_input() should accept a prefill parameter."""
+        import inspect
+        sig = inspect.signature(vc.TUI.get_input)
+        assert "prefill" in sig.parameters
+
+    def test_get_multiline_input_accepts_prefill(self):
+        """get_multiline_input() should accept a prefill parameter."""
+        import inspect
+        sig = inspect.signature(vc.TUI.get_multiline_input)
+        assert "prefill" in sig.parameters
+
+    def test_show_input_separator_exists(self):
+        """TUI should have show_input_separator() method."""
+        assert hasattr(vc.TUI, "show_input_separator")
+        assert callable(getattr(vc.TUI, "show_input_separator"))
+
+
+class TestWebSearchHtmlUnescape:
+    """Tests for HTML entity decoding in WebSearch results."""
+
+    def test_title_unescape_in_source(self):
+        """WebSearchTool._ddg_search should call html_module.unescape on titles."""
+        import inspect
+        source = inspect.getsource(vc.WebSearchTool._ddg_search)
+        # The title line should have html_module.unescape wrapping the re.sub
+        assert "html_module.unescape" in source
+
+    def test_snippet_unescape_in_source(self):
+        """WebSearchTool._ddg_search should call html_module.unescape on snippets."""
+        import inspect
+        source = inspect.getsource(vc.WebSearchTool._ddg_search)
+        # Count occurrences — should be at least 2 (title + snippet)
+        count = source.count("html_module.unescape")
+        assert count >= 2, f"Expected at least 2 html_module.unescape calls, got {count}"
