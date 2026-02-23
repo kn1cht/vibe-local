@@ -3864,9 +3864,9 @@ class MultiAgentCoordinator:
                 elapsed = time.time() - _hb_start
                 done = _done_count[0]
                 with _print_lock:
-                    print(f"  {_ansi(chr(27)+'[38;5;226m')}⏳ Parallel agents: "
-                          f"{done}/{total} done, {elapsed:.0f}s elapsed...{C.RESET}",
-                          flush=True)
+                    msg = (f"  {_ansi(chr(27)+'[38;5;226m')}⏳ Parallel agents: "
+                           f"{done}/{total} done, {elapsed:.0f}s elapsed...{C.RESET}")
+                    print(f"\r{msg}   ", end="", flush=True)
 
         hb_thread = threading.Thread(target=_heartbeat, daemon=True)
         hb_thread.start()
@@ -3882,6 +3882,9 @@ class MultiAgentCoordinator:
 
         _heartbeat_stop.set()
         hb_thread.join(timeout=2)
+        # Clear heartbeat line
+        with _print_lock:
+            print(f"\r{' ' * 70}\r", end="", flush=True)
 
         # Mark timed-out agents
         for i, r in enumerate(results):
@@ -5054,6 +5057,7 @@ class TUI:
         _approx_tokens = 0
         _last_status_update = 0.0
         _status_line_shown = False
+        _status_line_len = 60  # track length for clean clearing
 
         for chunk in response_iter:
             choice = chunk.get("choices", [{}])[0]
@@ -5075,14 +5079,16 @@ class TUI:
 
             content = delta.get("content", "")
             if not content:
-                # Even without content, update status line periodically
+                # Even without content, update status line periodically (interactive only)
                 _now = time.time()
-                if not header_printed and (_now - _last_status_update) >= 0.5:
+                if self.is_interactive and not header_printed and (_now - _last_status_update) >= 0.5:
                     _elapsed = _now - _stream_start
                     _tok_display = f"{_approx_tokens / 1000:.1f}k" if _approx_tokens >= 1000 else str(_approx_tokens)
                     _status_msg = f"  \U0001f4ad Thinking... ({_elapsed:.0f}s \u00b7 \u2193 {_tok_display} tokens)"
-                    print(f"\r{_status_msg}   ", end="", flush=True)
+                    _clear_w = max(len(_status_msg) + 4, 60)
+                    print(f"\r{_status_msg}{' ' * 4}", end="", flush=True)
                     _status_line_shown = True
+                    _status_line_len = _clear_w
                     _last_status_update = _now
                 continue
             # Approximate token count: ~4 chars per token
@@ -5090,14 +5096,16 @@ class TUI:
             raw_parts.append(content)
             think_buf += content
 
-            # Update status line while in think mode or before header printed
+            # Update status line while in think mode or before header printed (interactive only)
             _now = time.time()
-            if not header_printed and (_now - _last_status_update) >= 0.5:
+            if self.is_interactive and not header_printed and (_now - _last_status_update) >= 0.5:
                 _elapsed = _now - _stream_start
                 _tok_display = f"{_approx_tokens / 1000:.1f}k" if _approx_tokens >= 1000 else str(_approx_tokens)
                 _status_msg = f"  \U0001f4ad Thinking... ({_elapsed:.0f}s \u00b7 \u2193 {_tok_display} tokens)"
-                print(f"\r{_status_msg}   ", end="", flush=True)
+                _clear_w = max(len(_status_msg) + 4, 60)
+                print(f"\r{_status_msg}{' ' * 4}", end="", flush=True)
                 _status_line_shown = True
+                _status_line_len = _clear_w
                 _last_status_update = _now
 
             # State machine: detect <think> and </think> tags even split across chunks
@@ -5116,7 +5124,7 @@ class TUI:
                         if to_print:
                             if not header_printed:
                                 if _status_line_shown:
-                                    print(f"\r{' ' * 60}\r", end="", flush=True)
+                                    print(f"\r{' ' * _status_line_len}\r", end="", flush=True)
                                     _status_line_shown = False
                                 print(f"\n{C.BBLUE}assistant{C.RESET}: ", end="", flush=True)
                                 header_printed = True
@@ -5128,7 +5136,7 @@ class TUI:
                         if to_print:
                             if not header_printed:
                                 if _status_line_shown:
-                                    print(f"\r{' ' * 60}\r", end="", flush=True)
+                                    print(f"\r{' ' * _status_line_len}\r", end="", flush=True)
                                     _status_line_shown = False
                                 print(f"\n{C.BBLUE}assistant{C.RESET}: ", end="", flush=True)
                                 header_printed = True
@@ -5148,7 +5156,7 @@ class TUI:
 
         # Clear status line before final output
         if _status_line_shown:
-            print(f"\r{' ' * 60}\r", end="", flush=True)
+            print(f"\r{' ' * _status_line_len}\r", end="", flush=True)
             _status_line_shown = False
 
         # Flush remaining buffer
@@ -5523,15 +5531,17 @@ class TUI:
         _start = time.time()
 
         def _update():
+            _clear_len = 60
             while not self._spinner_stop.is_set():
                 elapsed = time.time() - _start
-                msg = f"  \U0001f527 Running {tool_name}... ({elapsed:.0f}s)"
+                msg = f"  {_icon} Running {tool_name}... ({elapsed:.0f}s)"
+                _clear_len = max(_clear_len, len(msg) + 4)
                 with _print_lock:
                     print(f"\r{msg}   ", end="", flush=True)
                 self._spinner_stop.wait(1.0)
             # Clear the status line
             with _print_lock:
-                print(f"\r{' ' * 60}\r", end="", flush=True)
+                print(f"\r{' ' * _clear_len}\r", end="", flush=True)
 
         self._spinner_thread = threading.Thread(target=_update, daemon=True)
         self._spinner_thread.start()
@@ -5970,8 +5980,12 @@ class Agent:
                             _tool_dur = time.time() - _tool_t0
                             if is_long_op:
                                 self.tui.stop_spinner()
-                            self.tui.show_tool_result(tool_name, output, duration=_tool_dur, params=tool_params)
-                            results.append(ToolResult(tc_id, output))
+                            _is_err = isinstance(output, str) and (
+                                output.startswith("Error:") or output.startswith("Error -")
+                            )
+                            self.tui.show_tool_result(tool_name, output, is_error=_is_err,
+                                                      duration=_tool_dur, params=tool_params)
+                            results.append(ToolResult(tc_id, output, _is_err))
 
                             # Refresh file watcher snapshot after writes
                             if tool_name in ("Write", "Edit") and self.file_watcher.enabled:

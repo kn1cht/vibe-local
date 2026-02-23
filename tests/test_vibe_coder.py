@@ -7655,6 +7655,7 @@ class TestStreamingEnhancement:
         tui._term_cols = 80
         tui._term_rows = 24
         tui._no_color = True
+        tui.is_interactive = False
 
         # Simulate streaming chunks with tool call deltas
         chunks = [
@@ -7677,6 +7678,7 @@ class TestStreamingEnhancement:
         tui._term_cols = 80
         tui._term_rows = 24
         tui._no_color = True
+        tui.is_interactive = False
 
         chunks = [
             {"choices": [{"delta": {"content": "Hello "}}]},
@@ -8349,3 +8351,33 @@ class TestWebSearchHtmlUnescape:
         # Count occurrences — should be at least 2 (title + snippet)
         count = source.count("html_module.unescape")
         assert count >= 2, f"Expected at least 2 html_module.unescape calls, got {count}"
+
+
+class TestErrorResultDetection:
+    """Tests for error detection in tool results (H1 fix from UX audit)."""
+
+    def test_error_string_detected(self):
+        """Tool results starting with 'Error:' should be flagged as errors."""
+        # The sequential execution path should detect error strings
+        import inspect
+        source = inspect.getsource(vc.Agent.run)
+        assert "output.startswith" in source or "is_err" in source
+
+    def test_stream_response_guarded_by_is_interactive(self):
+        """Status line in stream_response should check is_interactive (H3 fix)."""
+        import inspect
+        source = inspect.getsource(vc.TUI.stream_response)
+        assert "is_interactive" in source
+
+    def test_tool_status_uses_correct_icon(self):
+        """start_tool_status should use the tool-specific icon, not hardcoded wrench (M2 fix)."""
+        import inspect
+        source = inspect.getsource(vc.TUI.start_tool_status)
+        # Should reference _icon from _tool_icons, not hardcode \U0001f527 in the message
+        assert "_icon" in source
+
+    def test_heartbeat_uses_carriage_return(self):
+        """Parallel agent heartbeat should use \\r for in-place update (L6 fix)."""
+        import inspect
+        source = inspect.getsource(vc.MultiAgentCoordinator.run_parallel)
+        assert "\\r" in source or "\r" in source
