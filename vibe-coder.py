@@ -4563,6 +4563,10 @@ class Agent:
                 # 6. Add tool results to history
                 self.session.add_tool_results(results)
 
+                # Skip compaction if interrupted — just save partial results and break
+                if self._interrupted.is_set():
+                    break
+
                 # 7. Context compaction check
                 before_tokens = self.session.get_token_estimate()
                 self.session.compact_if_needed()
@@ -4622,6 +4626,8 @@ class Agent:
                 break
         else:
             print(f"\n{C.YELLOW}Reached max iterations ({self.MAX_ITERATIONS}). Stopping.{C.RESET}")
+            print(f"{C.DIM}The conversation may need to be broken into smaller steps.{C.RESET}")
+            print(f"{C.DIM}Try: /compact to free context, then continue.{C.RESET}")
 
     def interrupt(self):
         self._interrupted.set()

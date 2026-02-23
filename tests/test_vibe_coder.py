@@ -6108,3 +6108,108 @@ class TestBeginnerUXImprovements:
         import inspect
         source = inspect.getsource(vc._build_system_prompt)
         assert "truncat" in source.lower()
+
+
+class TestV091Improvements:
+    """Tests for v0.9.1 improvements."""
+
+    def test_debug_toggle_command_exists(self):
+        """The /debug command should be handled in the interactive loop."""
+        import inspect
+        source = inspect.getsource(vc.main)
+        assert '"/debug"' in source
+
+    def test_help_includes_debug_command(self):
+        """The /help output should list /debug command."""
+        import inspect
+        source = inspect.getsource(vc.TUI.show_help)
+        assert "/debug" in source
+
+    def test_help_includes_askuserquestion(self):
+        """The /help tool list should include AskUserQuestion."""
+        import inspect
+        source = inspect.getsource(vc.TUI.show_help)
+        assert "AskUserQuestion" in source
+
+    def test_ollama_autostart_linux(self):
+        """Ollama auto-start should work on Linux too (shutil.which check)."""
+        import inspect
+        source = inspect.getsource(vc.main)
+        # Should use shutil.which("ollama") instead of just checking Darwin
+        assert "shutil.which" in source
+
+    def test_ollama_autostart_macos_app(self):
+        """On macOS, should try 'open -a Ollama' first."""
+        import inspect
+        source = inspect.getsource(vc.main)
+        assert 'open", "-a", "Ollama' in source or "open -a Ollama" in source
+
+    def test_interrupted_skips_compaction(self):
+        """After interrupt, should skip compaction and break immediately."""
+        import inspect
+        source = inspect.getsource(vc.Agent.run)
+        # Should check _interrupted before compact_if_needed
+        assert "interrupted" in source
+        # Verify the pattern: check interrupted → break before compaction
+        idx_interrupted = source.find("Skip compaction if interrupted")
+        idx_compact = source.find("compact_if_needed")
+        assert idx_interrupted != -1, "Should have interrupt-skip-compaction comment"
+        assert idx_interrupted < idx_compact, "Interrupt check should come before compaction"
+
+    def test_max_iterations_helpful_message(self):
+        """Max iterations message should include helpful hints."""
+        import inspect
+        source = inspect.getsource(vc.Agent.run)
+        assert "/compact" in source
+
+    def test_compaction_orphan_cleanup_no_pop0(self):
+        """Compaction orphan cleanup should use slice, not pop(0) loop."""
+        import inspect
+        source = inspect.getsource(vc.Session.compact_if_needed)
+        # The fallback path should not use pop(0) for the final safety check
+        # It should use a skip counter + slice instead
+        assert "skip" in source or "slice" in source.lower()
+
+    def test_install_sh_has_pacman(self):
+        """install.sh should support pacman for Arch Linux."""
+        with open(os.path.join(VIBE_LOCAL_DIR, "install.sh")) as f:
+            content = f.read()
+        assert "pacman" in content
+
+    def test_install_sh_has_zypper(self):
+        """install.sh should support zypper for openSUSE."""
+        with open(os.path.join(VIBE_LOCAL_DIR, "install.sh")) as f:
+            content = f.read()
+        assert "zypper" in content
+
+    def test_install_sh_has_apk(self):
+        """install.sh should support apk for Alpine Linux."""
+        with open(os.path.join(VIBE_LOCAL_DIR, "install.sh")) as f:
+            content = f.read()
+        assert "apk add" in content
+
+    def test_install_sh_wsl_detection(self):
+        """install.sh should detect WSL environment."""
+        with open(os.path.join(VIBE_LOCAL_DIR, "install.sh")) as f:
+            content = f.read()
+        assert "WSL" in content
+
+    def test_install_sh_proxy_detection(self):
+        """install.sh should detect proxy environment."""
+        with open(os.path.join(VIBE_LOCAL_DIR, "install.sh")) as f:
+            content = f.read()
+        assert "HTTP_PROXY" in content
+
+    def test_install_sh_model_retry(self):
+        """install.sh should retry model downloads."""
+        with open(os.path.join(VIBE_LOCAL_DIR, "install.sh")) as f:
+            content = f.read()
+        assert "attempt" in content and "retry" in content.lower()
+
+    def test_install_sh_dynamic_shell_rc(self):
+        """install.sh should detect shell rc file dynamically."""
+        with open(os.path.join(VIBE_LOCAL_DIR, "install.sh")) as f:
+            content = f.read()
+        assert ".bashrc" in content and ".zshrc" in content
+        # Should use SHELL_RC variable, not hardcoded ~/.zshrc
+        assert "SHELL_RC" in content
