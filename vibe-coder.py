@@ -856,8 +856,8 @@ class Config:
                             help="Alias for -y (compatibility)")
         # RAG options
         parser.add_argument("--rag", action="store_true", help="Enable RAG mode")
-        parser.add_argument("--rag-mode", choices=["query", "auto"], default="query",
-                            help="RAG mode: query or auto (default: query)")
+        parser.add_argument("--rag-mode", choices=["query"], default="query",
+                            help="RAG mode (default: query)")
         parser.add_argument("--rag-path", help="Path to use for RAG context")
         parser.add_argument("--rag-topk", type=int, default=5,
                             help="Number of top results for RAG (default: 5)")
