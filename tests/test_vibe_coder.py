@@ -7656,6 +7656,7 @@ class TestStreamingEnhancement:
         tui._term_rows = 24
         tui._no_color = True
         tui.is_interactive = False
+        tui.scroll_region = vc.ScrollRegion()
 
         # Simulate streaming chunks with tool call deltas
         chunks = [
@@ -7671,6 +7672,26 @@ class TestStreamingEnhancement:
         assert tool_calls[0]["function"]["name"] == "Grep"
         assert '"pattern": "TODO"' in tool_calls[0]["function"]["arguments"]
 
+    def test_stream_response_int_arguments_no_crash(self):
+        """stream_response should handle non-string tool_call delta arguments."""
+        tui = vc.TUI.__new__(vc.TUI)
+        tui._is_cjk = False
+        tui._term_cols = 80
+        tui._term_rows = 24
+        tui._no_color = True
+        tui.is_interactive = False
+        tui.scroll_region = vc.ScrollRegion()
+
+        # Simulate LLM sending non-string arguments (e.g., int)
+        chunks = [
+            {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "call_x", "function": {"name": "Bash", "arguments": ""}}]}}]},
+            {"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": 123}}]}}]},
+            {"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": '}'}}]}}]},
+        ]
+        text, tool_calls = tui.stream_response(iter(chunks))
+        assert len(tool_calls) == 1
+        assert "123" in tool_calls[0]["function"]["arguments"]
+
     def test_stream_response_no_tools(self):
         """stream_response with text-only should return empty tool_calls."""
         tui = vc.TUI.__new__(vc.TUI)
@@ -7679,6 +7700,7 @@ class TestStreamingEnhancement:
         tui._term_rows = 24
         tui._no_color = True
         tui.is_interactive = False
+        tui.scroll_region = vc.ScrollRegion()
 
         chunks = [
             {"choices": [{"delta": {"content": "Hello "}}]},
@@ -8381,3 +8403,994 @@ class TestErrorResultDetection:
         import inspect
         source = inspect.getsource(vc.MultiAgentCoordinator.run_parallel)
         assert "\\r" in source or "\r" in source
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# ScrollRegion tests
+# ════════════════════════════════════════════════════════════════════════════════
+
+class TestScrollRegion:
+    """Tests for ScrollRegion DECSTBM functionality."""
+
+    def test_init_defaults(self):
+        """ScrollRegion starts inactive with no cached dimensions."""
+        sr = vc.ScrollRegion()
+        assert sr._active is False
+        assert sr._rows == 0
+        assert sr._cols == 0
+        assert sr._status_text == ""
+        assert sr._hint_text == ""
+
+    def test_supported_non_tty(self):
+        """supported() returns False when stdout is not a TTY."""
+        sr = vc.ScrollRegion()
+        with mock.patch.object(sys.stdout, 'isatty', return_value=False):
+            assert sr.supported() is False
+
+    def test_supported_windows(self):
+        """supported() returns False on Windows."""
+        sr = vc.ScrollRegion()
+        with mock.patch('os.name', 'nt'):
+            assert sr.supported() is False
+
+    def test_supported_dumb_term(self):
+        """supported() returns False with TERM=dumb."""
+        sr = vc.ScrollRegion()
+        with mock.patch.dict(os.environ, {'TERM': 'dumb'}):
+            assert sr.supported() is False
+
+    def test_supported_env_opt_out(self):
+        """supported() returns False when VIBE_NO_SCROLL=1."""
+        sr = vc.ScrollRegion()
+        with mock.patch.dict(os.environ, {'VIBE_NO_SCROLL': '1'}):
+            assert sr.supported() is False
+
+    def test_supported_colors_disabled(self):
+        """supported() returns False when colors are disabled."""
+        sr = vc.ScrollRegion()
+        old = vc.C._enabled
+        try:
+            vc.C._enabled = False
+            assert sr.supported() is False
+        finally:
+            vc.C._enabled = old
+
+    def test_supported_small_terminal(self):
+        """supported() returns False when terminal is too small (<10 rows)."""
+        sr = vc.ScrollRegion()
+        with mock.patch('shutil.get_terminal_size', return_value=os.terminal_size((80, 8))):
+            with mock.patch.object(sys.stdout, 'isatty', return_value=True):
+                with mock.patch.object(sys.stdin, 'isatty', return_value=True):
+                    assert sr.supported() is False
+
+    def test_supported_normal_tty(self):
+        """supported() returns True for normal TTY environment."""
+        sr = vc.ScrollRegion()
+        with mock.patch.object(sys.stdout, 'isatty', return_value=True), \
+             mock.patch.object(sys.stdin, 'isatty', return_value=True), \
+             mock.patch('os.name', 'posix'), \
+             mock.patch.dict(os.environ, {}, clear=False), \
+             mock.patch('shutil.get_terminal_size', return_value=os.terminal_size((80, 24))):
+            # Ensure TERM != dumb and colors enabled
+            env = os.environ.copy()
+            env.pop('TERM', None)
+            env.pop('NO_COLOR', None)
+            old_enabled = vc.C._enabled
+            vc.C._enabled = True
+            try:
+                with mock.patch.dict(os.environ, env, clear=True):
+                    assert sr.supported() is True
+            finally:
+                vc.C._enabled = old_enabled
+
+    def test_setup_emits_decstbm(self):
+        """setup() should emit DECSTBM escape sequence."""
+        sr = vc.ScrollRegion()
+        buf = StringIO()
+        with mock.patch('shutil.get_terminal_size', return_value=os.terminal_size((80, 24))):
+            with mock.patch('sys.stdout', buf):
+                sr.setup()
+        output = buf.getvalue()
+        assert sr._active is True
+        assert sr._rows == 24
+        # Should contain DECSTBM: \033[1;21r (24 - 3 = 21)
+        assert "\033[1;21r" in output
+        # No DECSC/DECRC — Reset-Draw-Restore pattern used instead
+        assert "\0337" not in output
+        assert "\0338" not in output
+
+    def test_setup_small_terminal_noop(self):
+        """setup() should not activate for terminals <10 rows."""
+        sr = vc.ScrollRegion()
+        with mock.patch('shutil.get_terminal_size', return_value=os.terminal_size((80, 8))):
+            sr.setup()
+        assert sr._active is False
+
+    def test_teardown_resets(self):
+        """teardown() should reset scroll region and deactivate."""
+        sr = vc.ScrollRegion()
+        buf = StringIO()
+        with mock.patch('shutil.get_terminal_size', return_value=os.terminal_size((80, 24))):
+            with mock.patch('sys.stdout', buf):
+                sr.setup()
+                assert sr._active is True
+                buf.truncate(0)
+                buf.seek(0)
+                sr.teardown()
+        output = buf.getvalue()
+        assert sr._active is False
+        # Should contain explicit full-screen reset: \033[1;24r
+        assert "\033[1;24r" in output
+
+    def test_teardown_noop_when_inactive(self):
+        """teardown() does nothing when not active."""
+        sr = vc.ScrollRegion()
+        buf = StringIO()
+        with mock.patch('sys.stdout', buf):
+            sr.teardown()
+        assert buf.getvalue() == ""
+
+    def test_print_output_active(self):
+        """print_output() writes directly when active (DECSTBM handles scrolling)."""
+        sr = vc.ScrollRegion()
+        buf = StringIO()
+        with mock.patch('shutil.get_terminal_size', return_value=os.terminal_size((80, 24))):
+            with mock.patch('sys.stdout', buf):
+                sr.setup()
+                buf.truncate(0)
+                buf.seek(0)
+                sr.print_output("hello world\n")
+        output = buf.getvalue()
+        assert "hello world" in output
+        # No cursor save/restore — DECSTBM auto-scrolls
+        assert "\0337" not in output
+
+    def test_print_output_inactive_fallback(self):
+        """print_output() falls back to sys.stdout.write when not active."""
+        sr = vc.ScrollRegion()
+        buf = StringIO()
+        with mock.patch('sys.stdout', buf):
+            sr.print_output("fallback text\n")
+        assert "fallback text" in buf.getvalue()
+        # No cursor save/restore when inactive
+        assert "\0337" not in buf.getvalue()
+
+    def test_update_status(self):
+        """update_status() stores text only — NO terminal write."""
+        sr = vc.ScrollRegion()
+        buf = StringIO()
+        with mock.patch('shutil.get_terminal_size', return_value=os.terminal_size((80, 24))):
+            with mock.patch('sys.stdout', buf):
+                sr.setup()
+                buf.truncate(0)
+                buf.seek(0)
+                sr.update_status("Running Bash... (3s)")
+        output = buf.getvalue()
+        # update_status() is store-only — no terminal write
+        assert output == "", "update_status() must NOT write to terminal"
+        assert sr._status_text == "Running Bash... (3s)"
+
+    def test_update_hint(self):
+        """update_hint() stores hint text only — NO terminal write."""
+        sr = vc.ScrollRegion()
+        buf = StringIO()
+        with mock.patch('shutil.get_terminal_size', return_value=os.terminal_size((80, 24))):
+            with mock.patch('sys.stdout', buf):
+                sr.setup()
+                buf.truncate(0)
+                buf.seek(0)
+                sr.update_hint("hello world")
+        output = buf.getvalue()
+        # update_hint() is store-only — no terminal write
+        assert output == "", "update_hint() must NOT write to terminal"
+        assert sr._hint_text == "hello world"
+
+    def test_clear_status(self):
+        """clear_status() clears status text and draws inline blank; hint text preserved."""
+        sr = vc.ScrollRegion()
+        buf = StringIO()
+        with mock.patch('shutil.get_terminal_size', return_value=os.terminal_size((80, 24))):
+            with mock.patch('sys.stdout', buf):
+                sr.setup()
+                sr.update_status("test status")
+                sr.update_hint("test hint")
+                sr.clear_status()
+        assert sr._status_text == ""
+        # clear_status() only clears _status_text; hint text is preserved
+        assert sr._hint_text == "test hint"
+
+    def test_resize_updates_dimensions(self):
+        """resize() updates terminal dimensions and resets scroll region."""
+        sr = vc.ScrollRegion()
+        buf = StringIO()
+        with mock.patch('shutil.get_terminal_size', return_value=os.terminal_size((80, 24))):
+            with mock.patch('sys.stdout', buf):
+                sr.setup()
+        assert sr._rows == 24
+        buf2 = StringIO()
+        with mock.patch('shutil.get_terminal_size', return_value=os.terminal_size((120, 40))):
+            with mock.patch('sys.stdout', buf2):
+                sr.resize()
+        assert sr._rows == 40
+        assert sr._cols == 120
+        output = buf2.getvalue()
+        # Should set new scroll region: rows - 3 = 37
+        assert "\033[1;37r" in output
+
+    def test_resize_teardown_if_too_small(self):
+        """resize() tears down if terminal becomes too small."""
+        sr = vc.ScrollRegion()
+        buf = StringIO()
+        with mock.patch('shutil.get_terminal_size', return_value=os.terminal_size((80, 24))):
+            with mock.patch('sys.stdout', buf):
+                sr.setup()
+        assert sr._active is True
+        buf2 = StringIO()
+        with mock.patch('shutil.get_terminal_size', return_value=os.terminal_size((80, 5))):
+            with mock.patch('sys.stdout', buf2):
+                sr.resize()
+        assert sr._active is False
+
+    def test_resize_nonblocking_lock(self):
+        """resize() uses non-blocking lock to avoid deadlock from signal handler."""
+        sr = vc.ScrollRegion()
+        buf = StringIO()
+        with mock.patch('shutil.get_terminal_size', return_value=os.terminal_size((80, 24))):
+            with mock.patch('sys.stdout', buf):
+                sr.setup()
+        assert sr._active is True
+        # Simulate another thread holding the lock (SIGWINCH scenario)
+        sr._lock.acquire()
+        try:
+            buf2 = StringIO()
+            with mock.patch('shutil.get_terminal_size', return_value=os.terminal_size((120, 40))):
+                with mock.patch('sys.stdout', buf2):
+                    sr.resize()  # Should return early, not deadlock
+            # Dimensions should NOT change (lock not acquired)
+            assert sr._rows == 24
+            assert sr._cols == 80
+        finally:
+            sr._lock.release()
+
+    def test_teardown_zero_rows_guard(self):
+        """teardown() skips escape sequences if _rows <= 0."""
+        sr = vc.ScrollRegion()
+        sr._active = True
+        sr._rows = 0
+        buf = StringIO()
+        with mock.patch('sys.stdout', buf):
+            sr.teardown()
+        assert sr._active is False
+        # No escape sequences written (guard prevents bad values)
+        assert buf.getvalue() == ""
+
+    def test_setup_double_check_inside_lock(self):
+        """setup() checks _active inside lock — prevents double activation."""
+        sr = vc.ScrollRegion()
+        buf = StringIO()
+        with mock.patch('shutil.get_terminal_size', return_value=os.terminal_size((80, 24))):
+            with mock.patch('sys.stdout', buf):
+                sr.setup()
+        assert sr._active is True
+        # Second setup should be no-op (checked inside lock)
+        buf2 = StringIO()
+        with mock.patch('shutil.get_terminal_size', return_value=os.terminal_size((80, 24))):
+            with mock.patch('sys.stdout', buf2):
+                sr.setup()
+        # No output from second setup — early return inside lock
+        assert buf2.getvalue() == ""
+
+    def test_build_footer_buf_returns_string(self):
+        """_build_footer_buf() returns a single string with all footer content."""
+        sr = vc.ScrollRegion()
+        with mock.patch('shutil.get_terminal_size', return_value=os.terminal_size((80, 24))):
+            buf = StringIO()
+            with mock.patch('sys.stdout', buf):
+                sr.setup()
+        with sr._lock:
+            footer = sr._build_footer_buf()
+        assert isinstance(footer, str)
+        assert len(footer) > 0
+        # Should contain separator character
+        assert "─" in footer
+        # Should contain ESC: stop hint
+        assert "ESC: stop" in footer
+
+    def test_build_footer_buf_inactive_empty(self):
+        """_build_footer_buf() returns empty string when inactive."""
+        sr = vc.ScrollRegion()
+        with sr._lock:
+            footer = sr._build_footer_buf()
+        assert footer == ""
+
+    def test_atomic_write_setup(self):
+        """setup() should use a single sys.stdout.write() call."""
+        sr = vc.ScrollRegion()
+        write_calls = []
+        buf = StringIO()
+        original_write = buf.write
+        def tracking_write(s):
+            write_calls.append(s)
+            return original_write(s)
+        buf.write = tracking_write
+        with mock.patch('shutil.get_terminal_size', return_value=os.terminal_size((80, 24))):
+            with mock.patch('sys.stdout', buf):
+                sr.setup()
+        # Should be exactly 1 write call (atomic)
+        assert len(write_calls) == 1
+        # That single write should contain both DECSTBM and footer content
+        assert "\033[1;21r" in write_calls[0]
+        assert "─" in write_calls[0]
+
+    def test_update_status_is_store_only(self):
+        """update_status() stores text only — zero terminal writes."""
+        sr = vc.ScrollRegion()
+        buf = StringIO()
+        with mock.patch('shutil.get_terminal_size', return_value=os.terminal_size((80, 24))):
+            with mock.patch('sys.stdout', buf):
+                sr.setup()
+        write_calls = []
+        buf2 = StringIO()
+        original_write = buf2.write
+        def tracking_write(s):
+            write_calls.append(s)
+            return original_write(s)
+        buf2.write = tracking_write
+        with mock.patch('sys.stdout', buf2):
+            sr.update_status("test status")
+        # Store-only: zero writes
+        assert len(write_calls) == 0, f"Expected 0 writes, got {len(write_calls)}"
+        assert sr._status_text == "test status"
+
+    def test_teardown_preserves_status_text(self):
+        """teardown() should preserve _status_text and _hint_text for re-setup."""
+        sr = vc.ScrollRegion()
+        buf = StringIO()
+        with mock.patch('shutil.get_terminal_size', return_value=os.terminal_size((80, 24))):
+            with mock.patch('sys.stdout', buf):
+                sr.setup()
+                sr.update_status("my status")
+                sr.update_hint("my hint")
+                sr.teardown()
+        # Status and hint should be preserved across teardown
+        assert sr._status_text == "my status"
+        assert sr._hint_text == "my hint"
+
+    def test_teardown_setup_cycle_restores_footer(self):
+        """teardown() then setup() should redraw footer with preserved status."""
+        sr = vc.ScrollRegion()
+        buf = StringIO()
+        with mock.patch('shutil.get_terminal_size', return_value=os.terminal_size((80, 24))):
+            with mock.patch('sys.stdout', buf):
+                sr.setup()
+                sr.update_status("Ready")
+                sr.teardown()
+                buf.truncate(0)
+                buf.seek(0)
+                sr.setup()
+        output = buf.getvalue()
+        # The re-setup should draw the preserved "Ready" status
+        assert "Ready" in output
+
+    def test_setup_no_decsc_decrc(self):
+        """setup() must NOT emit DECSC (ESC 7) or DECRC (ESC 8)."""
+        sr = vc.ScrollRegion()
+        buf = StringIO()
+        with mock.patch('shutil.get_terminal_size', return_value=os.terminal_size((80, 24))):
+            with mock.patch('sys.stdout', buf):
+                sr.setup()
+        output = buf.getvalue()
+        assert "\0337" not in output, "DECSC found in setup() output"
+        assert "\0338" not in output, "DECRC found in setup() output"
+
+    def test_setup_footer_before_decstbm(self):
+        """setup() must draw footer BEFORE DECSTBM to avoid margin-outside cursor issues."""
+        sr = vc.ScrollRegion()
+        buf = StringIO()
+        with mock.patch('shutil.get_terminal_size', return_value=os.terminal_size((80, 24))):
+            with mock.patch('sys.stdout', buf):
+                sr.setup()
+        output = buf.getvalue()
+        # Footer contains separator character '─'
+        footer_pos = output.find("─")
+        decstbm_pos = output.find("\033[1;21r")
+        assert footer_pos >= 0, "Footer separator not found"
+        assert decstbm_pos >= 0, "DECSTBM not found"
+        assert footer_pos < decstbm_pos, "Footer must be drawn BEFORE DECSTBM"
+
+    def test_no_draw_inline_status_method(self):
+        """ScrollRegion must NOT have _draw_inline_status_locked or _refresh methods (removed)."""
+        sr = vc.ScrollRegion()
+        assert not hasattr(sr, '_draw_inline_status_locked'), \
+            "_draw_inline_status_locked should be removed (store-only approach)"
+        assert not hasattr(sr, '_refresh_status_locked'), \
+            "_refresh_status_locked should be removed (caused display corruption)"
+        assert not hasattr(sr, '_refresh_footer_locked'), \
+            "_refresh_footer_locked should be removed (caused display corruption)"
+
+    def test_clear_status_is_store_only(self):
+        """clear_status() clears text only — zero terminal writes."""
+        sr = vc.ScrollRegion()
+        buf = StringIO()
+        with mock.patch('shutil.get_terminal_size', return_value=os.terminal_size((80, 24))):
+            with mock.patch('sys.stdout', buf):
+                sr.setup()
+                sr.update_status("some status")
+        write_calls = []
+        buf2 = StringIO()
+        original_write = buf2.write
+        def tracking_write(s):
+            write_calls.append(s)
+            return original_write(s)
+        buf2.write = tracking_write
+        with mock.patch('sys.stdout', buf2):
+            sr.clear_status()
+        # Store-only: zero writes
+        assert len(write_calls) == 0, f"Expected 0 writes, got {len(write_calls)}"
+        assert sr._status_text == ""
+
+    def test_class_no_save_restore_attrs(self):
+        """ScrollRegion class must NOT have _SAVE or _RESTORE attributes."""
+        assert not hasattr(vc.ScrollRegion, '_SAVE'), "_SAVE should be removed"
+        assert not hasattr(vc.ScrollRegion, '_RESTORE'), "_RESTORE should be removed"
+        sr = vc.ScrollRegion()
+        assert not hasattr(sr, '_SAVE'), "_SAVE instance attr should not exist"
+        assert not hasattr(sr, '_RESTORE'), "_RESTORE instance attr should not exist"
+
+    def test_resize_uses_reset_pattern(self):
+        """resize() must teardown old margins, draw new footer, set new DECSTBM."""
+        sr = vc.ScrollRegion()
+        buf = StringIO()
+        with mock.patch('shutil.get_terminal_size', return_value=os.terminal_size((80, 24))):
+            with mock.patch('sys.stdout', buf):
+                sr.setup()
+        write_calls = []
+        buf2 = StringIO()
+        original_write = buf2.write
+        def tracking_write(s):
+            write_calls.append(s)
+            return original_write(s)
+        buf2.write = tracking_write
+        with mock.patch('shutil.get_terminal_size', return_value=os.terminal_size((120, 40))):
+            with mock.patch('sys.stdout', buf2):
+                sr.resize()
+        assert len(write_calls) == 1
+        data = write_calls[0]
+        # Teardown-Footer-Setup: \033[1;24r (reset OLD margins) ... footer ... \033[1;37r ... \033[37;1H
+        assert data.startswith("\033[1;24r"), "resize must start with old margin reset (\\033[1;24r)"
+        assert "\033[1;37r" in data, "DECSTBM with new size missing"
+        assert "\033[37;1H" in data, "Cursor position with new size missing"
+        assert "─" in data, "Footer content missing"
+
+    def test_debug_scroll_function_exists(self):
+        """_debug_scroll_region function should exist and be callable."""
+        assert hasattr(vc, '_debug_scroll_region'), "_debug_scroll_region not found"
+        assert callable(vc._debug_scroll_region)
+
+
+class TestScrollRegionIntegration:
+    """Integration tests for ScrollRegion with TUI."""
+
+    def test_tui_has_scroll_region(self):
+        """TUI instance should have a scroll_region attribute."""
+        config = vc.Config()
+        config.history_file = "/dev/null"
+        with mock.patch.object(vc, 'HAS_READLINE', False):
+            tui = vc.TUI(config)
+        assert hasattr(tui, 'scroll_region')
+        assert isinstance(tui.scroll_region, vc.ScrollRegion)
+
+    def test_scroll_print_routes_to_scroll_region(self):
+        """_scroll_print should print text when scroll region is active."""
+        config = vc.Config()
+        config.history_file = "/dev/null"
+        with mock.patch.object(vc, 'HAS_READLINE', False):
+            tui = vc.TUI(config)
+
+        buf = StringIO()
+        with mock.patch('shutil.get_terminal_size', return_value=os.terminal_size((80, 24))):
+            with mock.patch('sys.stdout', buf):
+                tui.scroll_region.setup()
+                buf.truncate(0)
+                buf.seek(0)
+                tui._scroll_print("test output")
+        output = buf.getvalue()
+        assert "test output" in output
+        tui.scroll_region._active = False  # cleanup
+
+    def test_scroll_print_normal_when_inactive(self):
+        """_scroll_print should use normal print when scroll region inactive."""
+        config = vc.Config()
+        config.history_file = "/dev/null"
+        with mock.patch.object(vc, 'HAS_READLINE', False):
+            tui = vc.TUI(config)
+
+        buf = StringIO()
+        with mock.patch('sys.stdout', buf):
+            tui._scroll_print("normal output")
+        output = buf.getvalue()
+        assert "normal output" in output
+        # No cursor save/restore
+        assert "\0337" not in output
+
+
+    def test_scroll_print_acquires_lock_when_active(self):
+        """_scroll_print should acquire scroll_region._lock when active,
+        preventing interleaving with cursor save/restore in status updates."""
+        config = vc.Config()
+        config.history_file = "/dev/null"
+        with mock.patch.object(vc, 'HAS_READLINE', False):
+            tui = vc.TUI(config)
+
+        buf = StringIO()
+        with mock.patch('shutil.get_terminal_size', return_value=os.terminal_size((80, 24))):
+            with mock.patch('sys.stdout', buf):
+                tui.scroll_region.setup()
+
+        # Hold the lock from another thread, verify _scroll_print blocks
+        blocked = threading.Event()
+        released = threading.Event()
+        printed = threading.Event()
+
+        def hold_lock():
+            with tui.scroll_region._lock:
+                blocked.set()
+                released.wait(timeout=2)
+
+        t = threading.Thread(target=hold_lock, daemon=True)
+        t.start()
+        blocked.wait(timeout=2)
+
+        # _scroll_print should block because the lock is held
+        def do_print():
+            buf2 = StringIO()
+            with mock.patch('sys.stdout', buf2):
+                tui._scroll_print("locked output")
+            printed.set()
+
+        t2 = threading.Thread(target=do_print, daemon=True)
+        t2.start()
+        # Give it a moment — it should NOT print yet
+        assert not printed.wait(timeout=0.1), "_scroll_print should block when lock is held"
+        released.set()
+        printed.wait(timeout=2)
+        t.join(timeout=2)
+        t2.join(timeout=2)
+        tui.scroll_region._active = False
+
+    def test_scroll_aware_print_acquires_lock_when_active(self):
+        """_scroll_aware_print should block when scroll region lock is held."""
+        sr = vc.ScrollRegion()
+        buf = StringIO()
+        with mock.patch('shutil.get_terminal_size', return_value=os.terminal_size((80, 24))):
+            with mock.patch('sys.stdout', buf):
+                sr.setup()
+
+        old = vc._active_scroll_region
+        vc._active_scroll_region = sr
+        try:
+            blocked = threading.Event()
+            released = threading.Event()
+            printed = threading.Event()
+
+            def hold_lock():
+                with sr._lock:
+                    blocked.set()
+                    released.wait(timeout=2)
+
+            t = threading.Thread(target=hold_lock, daemon=True)
+            t.start()
+            blocked.wait(timeout=2)
+
+            def do_print():
+                buf2 = StringIO()
+                with mock.patch('sys.stdout', buf2):
+                    vc._scroll_aware_print("locked text")
+                printed.set()
+
+            t2 = threading.Thread(target=do_print, daemon=True)
+            t2.start()
+            assert not printed.wait(timeout=0.1), "_scroll_aware_print should block when lock is held"
+            released.set()
+            printed.wait(timeout=2)
+            t.join(timeout=2)
+            t2.join(timeout=2)
+        finally:
+            vc._active_scroll_region = old
+            sr._active = False
+
+
+class TestScrollRegionCleanup:
+    """Tests for scroll region cleanup safety nets."""
+
+    def test_cleanup_function_resets_active(self):
+        """_cleanup_scroll_region should teardown an active scroll region."""
+        sr = vc.ScrollRegion()
+        buf = StringIO()
+        with mock.patch('shutil.get_terminal_size', return_value=os.terminal_size((80, 24))):
+            with mock.patch('sys.stdout', buf):
+                sr.setup()
+        assert sr._active is True
+
+        old = vc._active_scroll_region
+        vc._active_scroll_region = sr
+        try:
+            buf2 = StringIO()
+            with mock.patch('sys.stdout', buf2):
+                vc._cleanup_scroll_region()
+            assert sr._active is False
+            assert "\033[1;24r" in buf2.getvalue()
+        finally:
+            vc._active_scroll_region = old
+
+    def test_cleanup_noop_when_no_active_region(self):
+        """_cleanup_scroll_region should be safe when no region is active."""
+        old = vc._active_scroll_region
+        vc._active_scroll_region = None
+        try:
+            vc._cleanup_scroll_region()  # should not raise
+        finally:
+            vc._active_scroll_region = old
+
+    def test_scroll_aware_print_active(self):
+        """_scroll_aware_print prints text (DECSTBM handles scrolling)."""
+        sr = vc.ScrollRegion()
+        buf = StringIO()
+        with mock.patch('shutil.get_terminal_size', return_value=os.terminal_size((80, 24))):
+            with mock.patch('sys.stdout', buf):
+                sr.setup()
+
+        old = vc._active_scroll_region
+        vc._active_scroll_region = sr
+        try:
+            buf2 = StringIO()
+            with mock.patch('sys.stdout', buf2):
+                vc._scroll_aware_print("routed text")
+            output = buf2.getvalue()
+            assert "routed text" in output
+        finally:
+            vc._active_scroll_region = old
+            sr._active = False
+
+    def test_scroll_aware_print_inactive(self):
+        """_scroll_aware_print uses normal print when no active region."""
+        old = vc._active_scroll_region
+        vc._active_scroll_region = None
+        try:
+            buf = StringIO()
+            with mock.patch('sys.stdout', buf):
+                vc._scroll_aware_print("normal text")
+            assert "normal text" in buf.getvalue()
+            assert "\0337" not in buf.getvalue()
+        finally:
+            vc._active_scroll_region = old
+
+
+class TestInputMonitorTypeaheadCallback:
+    """Tests for InputMonitor on_typeahead callback."""
+
+    def test_callback_registered(self):
+        """InputMonitor should accept on_typeahead callback."""
+        cb = mock.Mock()
+        mon = vc.InputMonitor(on_typeahead=cb)
+        assert mon._on_typeahead is cb
+
+    def test_no_callback_default(self):
+        """InputMonitor without callback should have None."""
+        mon = vc.InputMonitor()
+        assert mon._on_typeahead is None
+
+    def test_notify_typeahead_calls_callback(self):
+        """_notify_typeahead should call the callback with decoded text."""
+        cb = mock.Mock()
+        mon = vc.InputMonitor(on_typeahead=cb)
+        with mon._typeahead_lock:
+            mon._typeahead.append(b'h')
+            mon._typeahead.append(b'i')
+        mon._notify_typeahead()
+        cb.assert_called_once_with("hi")
+
+    def test_notify_typeahead_empty(self):
+        """_notify_typeahead should call with empty string when buffer empty."""
+        cb = mock.Mock()
+        mon = vc.InputMonitor(on_typeahead=cb)
+        mon._notify_typeahead()
+        cb.assert_called_once_with("")
+
+    def test_notify_typeahead_exception_safe(self):
+        """_notify_typeahead should not raise even if callback raises."""
+        cb = mock.Mock(side_effect=RuntimeError("boom"))
+        mon = vc.InputMonitor(on_typeahead=cb)
+        with mon._typeahead_lock:
+            mon._typeahead.append(b'x')
+        mon._notify_typeahead()  # should not raise
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# MiniScreen — minimal terminal emulator for verifying rendered output
+# ════════════════════════════════════════════════════════════════════════════════
+
+class MiniScreen:
+    """Minimal VT100 emulator that processes CSI sequences into a 2D char grid.
+
+    Supports:
+      - CUP  \\033[r;cH  (cursor position)
+      - EL   \\033[2K    (erase entire line)
+      - SGR  \\033[...m  (ignored — just strips)
+      - DECSTBM \\033[t;br (sets scroll region boundaries)
+      - DECSC/DECRC (ignored — ScrollRegion doesn't use them)
+      - CSI s / CSI u  (handled for completeness; not used by ScrollRegion)
+      - Normal character printing with cursor advance
+    """
+
+    def __init__(self, rows=24, cols=80):
+        self.rows = rows
+        self.cols = cols
+        self.grid = [[' '] * cols for _ in range(rows)]
+        self.crow = 0  # 0-indexed
+        self.ccol = 0
+        self._saved_crow = 0
+        self._saved_ccol = 0
+
+    def feed(self, data):
+        """Parse escape sequences and text, update grid."""
+        i = 0
+        n = len(data)
+        while i < n:
+            ch = data[i]
+            if ch == '\033':
+                # ESC sequence
+                if i + 1 < n and data[i + 1] == '[':
+                    # CSI sequence: \033[ ... <letter>
+                    j = i + 2
+                    while j < n and (data[j].isdigit() or data[j] == ';'):
+                        j += 1
+                    if j < n:
+                        params_str = data[i + 2:j]
+                        cmd = data[j]
+                        self._handle_csi(params_str, cmd)
+                        i = j + 1
+                    else:
+                        i = j
+                elif i + 1 < n and data[i + 1] in ('7', '8'):
+                    # DECSC / DECRC — ignore
+                    i += 2
+                else:
+                    i += 1
+            elif ch == '\n':
+                self.crow = min(self.crow + 1, self.rows - 1)
+                self.ccol = 0
+                i += 1
+            elif ch == '\r':
+                self.ccol = 0
+                i += 1
+            elif ord(ch) >= 32:
+                # Printable character
+                if 0 <= self.crow < self.rows and 0 <= self.ccol < self.cols:
+                    self.grid[self.crow][self.ccol] = ch
+                    self.ccol += 1
+                    if self.ccol >= self.cols:
+                        self.ccol = self.cols - 1
+                else:
+                    self.ccol += 1
+                i += 1
+            else:
+                i += 1
+
+    def _handle_csi(self, params_str, cmd):
+        params = [int(x) if x else 0 for x in params_str.split(';')] if params_str else []
+        if cmd == 'H':
+            # CUP: \033[row;colH (1-based)
+            r = (params[0] if len(params) > 0 and params[0] > 0 else 1) - 1
+            c = (params[1] if len(params) > 1 and params[1] > 0 else 1) - 1
+            self.crow = max(0, min(r, self.rows - 1))
+            self.ccol = max(0, min(c, self.cols - 1))
+        elif cmd == 'K':
+            # EL: erase line
+            mode = params[0] if params else 0
+            if mode == 2:
+                # Erase entire line
+                if 0 <= self.crow < self.rows:
+                    self.grid[self.crow] = [' '] * self.cols
+        elif cmd == 'J':
+            # ED: erase display
+            mode = params[0] if params else 0
+            if mode == 0:
+                # Erase from cursor to end
+                if 0 <= self.crow < self.rows:
+                    self.grid[self.crow][self.ccol:] = [' '] * (self.cols - self.ccol)
+                for r in range(self.crow + 1, self.rows):
+                    self.grid[r] = [' '] * self.cols
+        elif cmd == 'r':
+            # DECSTBM — just record, don't affect grid
+            pass
+        elif cmd == 's':
+            # CSI s — save cursor position
+            self._saved_crow = self.crow
+            self._saved_ccol = self.ccol
+        elif cmd == 'u':
+            # CSI u — restore cursor position
+            self.crow = self._saved_crow
+            self.ccol = self._saved_ccol
+        elif cmd == 'm':
+            # SGR — color/style, ignore
+            pass
+
+    def get_row(self, row_1based):
+        """Get content of a row (1-based) as string, trailing spaces stripped."""
+        idx = row_1based - 1
+        if 0 <= idx < self.rows:
+            return ''.join(self.grid[idx]).rstrip()
+        return ''
+
+    def get_row_raw(self, row_1based):
+        """Get full content of a row (1-based) without stripping."""
+        idx = row_1based - 1
+        if 0 <= idx < self.rows:
+            return ''.join(self.grid[idx])
+        return ' ' * self.cols
+
+
+class TestScrollRegionScreen:
+    """Screen-level tests — verify actual rendered content via MiniScreen emulator."""
+
+    def _make_sr_and_screen(self, rows=24, cols=80):
+        """Create a ScrollRegion, run setup(), return (sr, MiniScreen)."""
+        sr = vc.ScrollRegion()
+        buf = StringIO()
+        with mock.patch('shutil.get_terminal_size', return_value=os.terminal_size((cols, rows))):
+            with mock.patch('sys.stdout', buf):
+                sr.setup()
+        screen = MiniScreen(rows, cols)
+        screen.feed(buf.getvalue())
+        return sr, screen, buf
+
+    def test_separator_rendered_at_correct_row(self):
+        """After setup(), separator (─) must appear at row rows-2."""
+        sr, screen, _ = self._make_sr_and_screen(24, 80)
+        sep_row = screen.get_row(22)  # rows - 2 = 22
+        assert '─' in sep_row, f"Separator not at row 22: {sep_row!r}"
+        # Separator should fill most of the line
+        assert sep_row.count('─') >= 40
+
+    def test_hint_rendered_at_bottom_row(self):
+        """After setup(), hint line (ESC: stop) must appear at row=rows."""
+        sr, screen, _ = self._make_sr_and_screen(24, 80)
+        hint_row = screen.get_row(24)
+        assert 'ESC: stop' in hint_row, f"Hint not at row 24: {hint_row!r}"
+
+    def test_status_rendered_at_setup(self):
+        """Status stored via update_status() appears in footer when setup() redraws."""
+        sr = vc.ScrollRegion()
+        with mock.patch('shutil.get_terminal_size', return_value=os.terminal_size((80, 24))):
+            # First setup
+            buf1 = StringIO()
+            with mock.patch('sys.stdout', buf1):
+                sr.setup()
+            # Store status (no terminal write)
+            sr.update_status("Thinking... (2s)")
+            # Teardown + re-setup: footer should include stored status
+            buf2 = StringIO()
+            with mock.patch('sys.stdout', buf2):
+                sr.teardown()
+                sr.setup()
+        screen = MiniScreen(24, 80)
+        screen.feed(buf2.getvalue())
+        # Status row = rows - 1 = 23
+        status_row = screen.get_row(23)
+        assert 'Thinking' in status_row, f"Status not at row 23: {status_row!r}"
+
+    def test_no_bracket_leak_in_any_row(self):
+        """No stray '[' from broken CSI sequences should appear."""
+        sr, screen, _ = self._make_sr_and_screen(24, 80)
+        # Update status to trigger Reset-Draw-Restore
+        buf2 = StringIO()
+        with mock.patch('sys.stdout', buf2):
+            sr.update_status("Running test")
+        screen.feed(buf2.getvalue())
+        # Check that no row contains a lone '[' that isn't part of real content
+        # The footer rows should not have unexpected '[' characters
+        for row_num in (22, 23, 24):
+            row_text = screen.get_row(row_num)
+            # '[' should not appear outside of intentional text
+            # (status text "Running test" has no brackets)
+            bracket_count = row_text.count('[')
+            assert bracket_count == 0, \
+                f"Stray '[' at row {row_num}: {row_text!r}"
+
+    def test_separator_persists_after_status_update(self):
+        """Separator must survive a Reset-Draw-Restore status update."""
+        sr, screen, _ = self._make_sr_and_screen(24, 80)
+        buf2 = StringIO()
+        with mock.patch('sys.stdout', buf2):
+            sr.update_status("Updated status")
+        screen.feed(buf2.getvalue())
+        sep_row = screen.get_row(22)
+        assert '─' in sep_row, f"Separator lost after update: {sep_row!r}"
+        assert sep_row.count('─') >= 40
+
+    def test_hint_with_typeahead(self):
+        """Hint with type-ahead appears only after setup(), not via update_hint() mid-scroll."""
+        # update_hint() stores text for next setup() but does not write to terminal
+        sr = vc.ScrollRegion()
+        buf = StringIO()
+        with mock.patch('shutil.get_terminal_size', return_value=os.terminal_size((80, 24))):
+            with mock.patch('sys.stdout', buf):
+                sr.setup()
+                sr.update_hint("hello world")
+                # Teardown and re-setup to see the hint in footer
+                sr.teardown()
+                buf.truncate(0)
+                buf.seek(0)
+                sr.setup()
+        screen = MiniScreen(24, 80)
+        screen.feed(buf.getvalue())
+        hint_row = screen.get_row(24)
+        assert 'hello world' in hint_row, f"Type-ahead missing after re-setup: {hint_row!r}"
+        assert 'ESC: stop' in hint_row
+
+    def test_footer_rows_empty_above_separator(self):
+        """Row above separator (row 21 for 24-row terminal) should be empty/blank."""
+        sr, screen, _ = self._make_sr_and_screen(24, 80)
+        row_above = screen.get_row(21)
+        # scroll_end row — should be empty (no footer content leaked up)
+        assert '─' not in row_above, f"Separator leaked to row 21: {row_above!r}"
+
+    def test_different_terminal_sizes(self):
+        """Footer should render at correct rows for various terminal sizes."""
+        for rows, cols in [(24, 80), (40, 120), (15, 60), (10, 40)]:
+            sr, screen, _ = self._make_sr_and_screen(rows, cols)
+            sep_row_num = rows - 2
+            status_row_num = rows - 1
+            hint_row_num = rows
+            sep = screen.get_row(sep_row_num)
+            hint = screen.get_row(hint_row_num)
+            assert '─' in sep, f"Separator missing at row {sep_row_num} ({cols}x{rows}): {sep!r}"
+            assert 'ESC: stop' in hint, f"Hint missing at row {hint_row_num} ({cols}x{rows}): {hint!r}"
+
+    def test_status_update_does_not_corrupt_separator(self):
+        """Multiple rapid status updates (store-only) should never corrupt the separator."""
+        sr, screen, _ = self._make_sr_and_screen(24, 80)
+        for i in range(10):
+            sr.update_status(f"Step {i}/9")
+        # No writes from update_status, so screen is unchanged from setup()
+        sep = screen.get_row(22)
+        assert '─' in sep and sep.count('─') >= 40, f"Separator corrupted: {sep!r}"
+        # Verify stored text
+        assert sr._status_text == "Step 9/9"
+
+    def test_resize_renders_footer_at_new_position(self):
+        """After resize(), footer must appear at the new rows."""
+        sr, screen, _ = self._make_sr_and_screen(24, 80)
+        # Resize to 40 rows
+        buf2 = StringIO()
+        with mock.patch('shutil.get_terminal_size', return_value=os.terminal_size((120, 40))):
+            with mock.patch('sys.stdout', buf2):
+                sr.resize()
+        screen2 = MiniScreen(40, 120)
+        screen2.feed(buf2.getvalue())
+        # New footer: rows 38 (sep), 39 (status), 40 (hint)
+        sep = screen2.get_row(38)
+        hint = screen2.get_row(40)
+        assert '─' in sep, f"Separator missing at row 38 after resize: {sep!r}"
+        assert 'ESC: stop' in hint, f"Hint missing at row 40 after resize: {hint!r}"
+
+    def test_teardown_clears_footer(self):
+        """teardown() should clear the footer area."""
+        sr = vc.ScrollRegion()
+        buf = StringIO()
+        with mock.patch('shutil.get_terminal_size', return_value=os.terminal_size((80, 24))):
+            with mock.patch('sys.stdout', buf):
+                sr.setup()
+                sr.update_status("active")
+        # Now teardown
+        buf2 = StringIO()
+        with mock.patch('sys.stdout', buf2):
+            sr.teardown()
+        # Feed both setup + teardown into screen
+        screen = MiniScreen(24, 80)
+        screen.feed(buf.getvalue())
+        screen.feed(buf2.getvalue())
+        # Footer area should be cleared
+        sep = screen.get_row(22)
+        assert '─' not in sep, f"Separator still visible after teardown: {sep!r}"

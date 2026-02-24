@@ -33,6 +33,7 @@ import urllib.parse
 import hashlib
 import traceback
 import base64
+import atexit
 from abc import ABC, abstractmethod
 from datetime import datetime
 import collections
@@ -63,6 +64,37 @@ _bg_tasks = {}
 _bg_task_counter = [0]
 _bg_tasks_lock = threading.Lock()
 MAX_BG_TASKS = 50  # Prevent unbounded memory growth
+
+# Active scroll region reference (set during agent execution)
+_active_scroll_region = None
+
+def _scroll_aware_print(*args, **kwargs):
+    """Print within scroll region or normal print.
+    When scroll region is active, acquires its lock to prevent text from
+    being written while the cursor is in the footer area (during status updates)."""
+    sr = _active_scroll_region
+    if sr is not None and sr._active:
+        with sr._lock:
+            print(*args, **kwargs)
+            sys.stdout.flush()
+    else:
+        print(*args, **kwargs)
+
+def _cleanup_scroll_region():
+    """Safety net: reset terminal scroll region on process exit."""
+    sr = _active_scroll_region
+    if sr is not None and sr._active:
+        try:
+            sr.teardown()
+        except Exception:
+            # Last resort: raw reset
+            try:
+                sys.stdout.write("\033[1;999r\033[?25h")
+                sys.stdout.flush()
+            except Exception:
+                pass
+
+atexit.register(_cleanup_scroll_region)
 
 __version__ = "1.3.1"
 
@@ -163,6 +195,348 @@ def _truncate_to_display_width(text, max_width):
 
 
 # ════════════════════════════════════════════════════════════════════════════════
+# DECSTBM Scroll Region — fixed status area at bottom of terminal
+# ════════════════════════════════════════════════════════════════════════════════
+
+class ScrollRegion:
+    """Split terminal into scrolling output area and fixed status footer.
+
+    Uses ANSI DECSTBM (Set Top and Bottom Margins) to create a scroll region
+    in the upper portion of the terminal, leaving the bottom STATUS_ROWS lines
+    fixed for status display, hints, and type-ahead preview.
+
+    Only active during agent execution in interactive mode (TTY).
+    Non-TTY, pipes, Windows, dumb terminals, and small terminals fall through
+    to normal print() behavior.
+    """
+
+    STATUS_ROWS = 3  # separator + status + hint
+
+    def __init__(self):
+        self._active = False
+        self._lock = threading.Lock()
+        self._rows = 0
+        self._cols = 0
+        self._scroll_end = 0
+        self._status_text = ""
+        self._hint_text = ""
+        # TUI debug logging: set VIBE_DEBUG_TUI=1 to log escape sequences
+        self._debug_log = None
+        if os.environ.get("VIBE_DEBUG_TUI") == "1":
+            try:
+                _log_path = os.path.join(os.path.expanduser("~"), ".vibe-tui-debug.log")
+                self._debug_log = open(_log_path, "a", encoding="utf-8")
+                self._debug_log.write(f"\n=== ScrollRegion debug log started ===\n")
+                self._debug_log.flush()
+            except Exception:
+                self._debug_log = None
+
+    def _log(self, label, buf):
+        """Log escape sequence output for debugging (only when VIBE_DEBUG_TUI=1)."""
+        if self._debug_log is None:
+            return
+        try:
+            import time as _t
+            ts = _t.strftime("%H:%M:%S")
+            # Show escape sequences as readable text
+            readable = buf.replace("\033", "ESC")
+            self._debug_log.write(f"[{ts}] {label}: {readable!r}\n")
+            self._debug_log.flush()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _atomic_write(buf):
+        """Write escape sequences as a single OS write when possible.
+
+        Buffer size is typically <1KB (well under POSIX PIPE_BUF=4096),
+        ensuring atomic write on all POSIX systems (macOS, Linux).
+        Falls back to sys.stdout.write() when stdout is mocked/redirected.
+        """
+        try:
+            fd = sys.stdout.fileno()
+            sys.stdout.flush()
+            os.write(fd, buf.encode("utf-8"))
+        except Exception:
+            sys.stdout.write(buf)
+            sys.stdout.flush()
+
+    def supported(self):
+        """Check if scroll region mode is supported in this environment."""
+        # Explicit opt-out via environment variable
+        if os.environ.get("VIBE_NO_SCROLL") == "1":
+            return False
+        # Must be a TTY
+        if not sys.stdout.isatty() or not sys.stdin.isatty():
+            return False
+        # Skip Windows (DECSTBM support is unreliable on conhost/WT)
+        if os.name == "nt":
+            return False
+        # Skip dumb terminals
+        term = os.environ.get("TERM", "")
+        if term == "dumb":
+            return False
+        # Skip if colors/ANSI disabled
+        if not C._enabled:
+            return False
+        # Need at least 10 rows
+        try:
+            size = shutil.get_terminal_size((80, 24))
+            if size.lines < 10:
+                return False
+        except (ValueError, OSError):
+            return False
+        return True
+
+    def setup(self):
+        """Activate scroll region: upper area scrolls, bottom STATUS_ROWS fixed."""
+        try:
+            size = shutil.get_terminal_size((80, 24))
+            rows = size.lines
+            cols = size.columns
+        except (ValueError, OSError):
+            return
+        if rows < 10:
+            return
+
+        scroll_end = rows - self.STATUS_ROWS
+        with self._lock:
+            if self._active:
+                return
+            self._rows = rows
+            self._cols = cols
+            self._active = True
+            self._scroll_end = scroll_end
+            # Draw footer first (no DECSTBM yet, all rows reachable), then set margins.
+            # Uses explicit full-screen margins instead of bare \033[r
+            # (Terminal.app may ignore parameterless DECSTBM reset).
+            buf = self._build_footer_buf()        # Footer (all rows reachable)
+            buf += f"\033[1;{scroll_end}r"        # Set scroll region
+            buf += f"\033[{scroll_end};1H"        # Cursor to scroll area bottom
+            self._log("setup", buf)
+            self._atomic_write(buf)
+
+    def teardown(self):
+        """Deactivate scroll region and restore full-screen scrolling."""
+        with self._lock:
+            if not self._active:
+                return
+            self._active = False
+            if self._rows <= 0:
+                return
+            # Explicit full-screen margins (Terminal.app ignores bare \033[r)
+            buf = f"\033[1;{self._rows}r"                # Reset to full screen
+            buf += f"\033[{self._rows - 2};1H\033[J"     # Clear footer area
+            buf += f"\033[{self._rows};1H"               # Move cursor to bottom
+            self._log("teardown", buf)
+            self._atomic_write(buf)
+            # Preserve status/hint text — they'll be restored on next setup()
+            # and overwritten by update_status() when needed
+
+    def resize(self):
+        """Handle terminal resize (SIGWINCH).
+
+        Safe to call from signal handler — uses non-blocking lock to avoid
+        deadlock if another thread holds the lock when SIGWINCH arrives.
+        """
+        try:
+            size = shutil.get_terminal_size((80, 24))
+            new_rows = size.lines
+            new_cols = size.columns
+        except (ValueError, OSError):
+            return
+        # Non-blocking lock: avoid deadlock when called from signal handler
+        acquired = self._lock.acquire(blocking=False)
+        if not acquired:
+            return  # Another thread holds the lock; resize will be retried on next SIGWINCH
+        try:
+            if not self._active:
+                return
+            if new_rows < 10:
+                self._active = False
+                if self._rows > 0:
+                    buf = f"\033[1;{self._rows}r"
+                    buf += f"\033[{self._rows - 2};1H\033[J"
+                    buf += f"\033[{self._rows};1H"
+                    self._log("teardown(resize)", buf)
+                    self._atomic_write(buf)
+                return
+            old_rows = self._rows
+            self._rows = new_rows
+            self._cols = new_cols
+            scroll_end = self._rows - self.STATUS_ROWS
+            self._scroll_end = scroll_end
+            # Teardown old region, draw new footer, set new region.
+            # Must do full teardown+setup because Terminal.app won't let
+            # CUP reach the old footer rows while DECSTBM is active.
+            buf = f"\033[1;{old_rows}r"                 # Reset old margins
+            buf += f"\033[{old_rows - 2};1H\033[J"      # Clear old footer
+            buf += self._build_footer_buf()             # Draw new footer
+            buf += f"\033[1;{scroll_end}r"              # Set new scroll region
+            buf += f"\033[{scroll_end};1H"              # Cursor to scroll area
+            self._log("resize", buf)
+            self._atomic_write(buf)
+        finally:
+            self._lock.release()
+
+    def print_output(self, text):
+        """Print text in the scrolling area.
+
+        DECSTBM handles auto-scrolling — just write at current cursor position.
+        Falls back to normal write if not active.
+        """
+        if not self._active:
+            sys.stdout.write(text)
+            sys.stdout.flush()
+            return
+        with self._lock:
+            # Write text at current cursor position — DECSTBM scrolls automatically
+            sys.stdout.write(text)
+            sys.stdout.flush()
+
+    def update_status(self, text):
+        """Store status text for display in footer (no immediate terminal write).
+
+        Status is rendered when setup() draws the footer. Use inline \\r
+        (within self._lock) for real-time mid-scroll status display.
+        Always stores text, even when scroll region is inactive.
+        """
+        with self._lock:
+            self._status_text = text
+
+    def update_hint(self, text):
+        """Store hint text (displayed in footer at next setup(), no terminal write).
+        Always stores even when inactive."""
+        with self._lock:
+            self._hint_text = text
+
+    def clear_status(self):
+        """Clear stored status text (no terminal write)."""
+        with self._lock:
+            self._status_text = ""
+
+    def _build_footer_buf(self):
+        """Build the footer escape sequences as a single string.
+        Returns empty string if scroll region is not active.
+        Caller must hold self._lock."""
+        if not self._active:
+            return ""
+        sep_row = self._rows - 2
+        status_row = self._rows - 1
+        hint_row = self._rows
+
+        _dim = "\033[38;5;240m"
+        _sep_color = "\033[38;5;245m"   # brighter than _dim for visibility
+        _rst = "\033[0m"
+
+        # Build entire footer as one string (prevents escape sequence fragmentation)
+        buf = f"\033[{sep_row};1H\033[2K{_sep_color}{'─' * self._cols}{_rst}"
+
+        status = self._status_text or ""
+        buf += f"\033[{status_row};1H\033[2K {status}{_rst}"
+
+        hint = self._hint_text or ""
+        hint_prefix = f" {_dim}ESC: stop"
+        if hint:
+            buf += f"\033[{hint_row};1H\033[2K{hint_prefix} | type-ahead: \"{hint}\"{_rst}"
+        else:
+            buf += f"\033[{hint_row};1H\033[2K{hint_prefix}{_rst}"
+        return buf
+
+
+def _debug_scroll_region(tui):
+    """DECSTBM diagnostic — test scroll region + inline status in Terminal.app."""
+    import time as _time
+    _c51 = _ansi("\033[38;5;51m")
+    _c198 = _ansi("\033[38;5;198m")
+    _c87 = _ansi("\033[38;5;87m")
+    _c245 = _ansi("\033[38;5;245m")
+    _rst = C.RESET
+
+    print(f"\n  {_c51}{C.BOLD}━━ Scroll Region Diagnostics ━━{_rst}")
+
+    is_tty = sys.stdout.isatty() and sys.stdin.isatty()
+    term = os.environ.get("TERM", "(not set)")
+    no_scroll = os.environ.get("VIBE_NO_SCROLL", "0")
+    try:
+        size = shutil.get_terminal_size((80, 24))
+        rows, cols = size.lines, size.columns
+    except (ValueError, OSError):
+        rows, cols = 0, 0
+
+    print(f"  {_c87}TTY:{_rst} {'yes' if is_tty else 'NO'}")
+    print(f"  {_c87}TERM:{_rst} {term}")
+    print(f"  {_c87}Size:{_rst} {cols}x{rows}")
+    print(f"  {_c87}VIBE_NO_SCROLL:{_rst} {no_scroll}")
+
+    if not is_tty:
+        print(f"  {_c198}Not a TTY — cannot test.{_rst}\n")
+        return
+    if rows < 10:
+        print(f"  {_c198}Terminal too small (need >=10 rows).{_rst}\n")
+        return
+
+    scroll_end = rows - 3
+    _dim = "\033[38;5;240m"
+    _sep_c = "\033[38;5;245m"
+    _r = "\033[0m"
+    sep_row = rows - 2
+    status_row = rows - 1
+    hint_row = rows
+
+    # Debug log info
+    _log_path = os.path.join(os.path.expanduser("~"), ".vibe-tui-debug.log")
+    _dbg = os.environ.get("VIBE_DEBUG_TUI", "0")
+    print(f"  {_c87}VIBE_DEBUG_TUI:{_rst} {_dbg}")
+    if _dbg == "1":
+        print(f"  {_c87}Log file:{_rst} {_log_path}")
+    else:
+        print(f"  {_c245}Tip: VIBE_DEBUG_TUI=1 python3 vibe-coder.py → logs to {_log_path}{_rst}")
+
+    # Test 1: Draw footer BEFORE DECSTBM (the setup pattern)
+    print(f"\n  {_c51}Test 1: Footer before DECSTBM (setup pattern){_rst}")
+    footer = f"\033[{sep_row};1H\033[2K{_sep_c}{'═' * cols}{_r}"
+    footer += f"\033[{status_row};1H\033[2K {_c87}[fixed] Status row{_r}"
+    footer += f"\033[{hint_row};1H\033[2K {_dim}[fixed] ESC: stop{_r}"
+    buf = footer
+    buf += f"\033[1;{scroll_end}r"
+    buf += f"\033[{scroll_end};1H"
+    sys.stdout.flush()
+    os.write(sys.stdout.fileno(), buf.encode("utf-8"))
+    print(f"  {C.GREEN}✓ Footer drawn + DECSTBM set{_rst}")
+    print(f"  {_c245}Bottom 3 rows should show: ═══, status, hint{_rst}")
+
+    # Test 2: Scrolling
+    print(f"\n  {_c51}Test 2: Scroll within DECSTBM region{_rst}")
+    for i in range(5):
+        print(f"  {_c245}scroll line {i+1}/5{_rst}")
+        _time.sleep(0.15)
+
+    # Test 3: Inline \r status (current approach — status within scroll region)
+    print(f"\n  {_c51}Test 3: Inline \\r status (store-only + \\r display){_rst}")
+    print(f"\r  {_c198}◠ Thinking... (inline via \\r){_r}    ", end="", flush=True)
+    _time.sleep(1)
+    print(f"\r{' ' * 60}\r", end="", flush=True)
+    print(f"  {C.GREEN}✓ Inline \\r status OK — no footer corruption{_rst}")
+    _time.sleep(0.5)
+
+    # Teardown
+    buf3 = f"\033[1;{rows}r"
+    buf3 += f"\033[{rows - 2};1H\033[J"
+    buf3 += f"\033[{rows};1H"
+    sys.stdout.flush()
+    os.write(sys.stdout.fileno(), buf3.encode("utf-8"))
+
+    print(f"\n  {_c51}Results:{_rst}")
+    print(f"  {C.GREEN}✓{_rst} Separator(═) visible at bottom throughout → footer-before-DECSTBM works")
+    print(f"  {C.GREEN}✓{_rst} Scroll lines above separator → DECSTBM scrolling works")
+    print(f"  {C.GREEN}✓{_rst} Inline \\r status appeared + cleared → store-only approach works")
+    print(f"  {_c198}✗{_rst} If artifacts, '[' chars, or missing footer → VIBE_NO_SCROLL=1")
+    print(f"  {_c245}For detailed debug: VIBE_DEBUG_TUI=1 python3 vibe-coder.py{_rst}")
+    print()
+
+
+# ════════════════════════════════════════════════════════════════════════════════
 # ESC key interrupt monitor (Unix only)
 # ════════════════════════════════════════════════════════════════════════════════
 
@@ -177,13 +551,14 @@ class InputMonitor:
     get_typeahead() + readline.set_startup_hook.
     """
 
-    def __init__(self):
+    def __init__(self, on_typeahead=None):
         self._pressed = threading.Event()
         self._stop_event = threading.Event()
         self._thread = None
         self._old_settings = None
         self._typeahead = []      # buffered keystrokes (bytes)
         self._typeahead_lock = threading.Lock()
+        self._on_typeahead = on_typeahead  # callback(text) for live type-ahead display
 
     @property
     def pressed(self):
@@ -249,10 +624,29 @@ class InputMonitor:
                     with self._typeahead_lock:
                         if self._typeahead:
                             self._typeahead.pop()
+                    self._notify_typeahead()
                 else:
                     # Buffer for type-ahead
                     with self._typeahead_lock:
                         self._typeahead.append(ch)
+                    self._notify_typeahead()
+
+    def _notify_typeahead(self):
+        """Call on_typeahead callback with current buffer text."""
+        if not self._on_typeahead:
+            return
+        with self._typeahead_lock:
+            if not self._typeahead:
+                text = ""
+            else:
+                try:
+                    text = b"".join(self._typeahead).decode("utf-8", errors="replace")
+                except Exception:
+                    text = ""
+        try:
+            self._on_typeahead(text)
+        except Exception:
+            pass
 
     def stop(self):
         """Stop monitoring and restore terminal settings."""
@@ -3046,6 +3440,9 @@ class AskUserQuestionTool(Tool):
         if not question:
             return "Error: question is required"
 
+        # Keep DECSTBM active — input works within the scroll region
+        _sr = _active_scroll_region
+
         with _print_lock:
             print(f"\n{_ansi(C.CYAN)}{_ansi(C.BOLD)}Question:{_ansi(C.RESET)} {question}")
             if options:
@@ -3160,7 +3557,7 @@ class SubAgentTool(Tool):
         prompt_preview = prompt[:80] + ("..." if len(prompt) > 80 else "")
         _sub_start = time.time()
         with _print_lock:
-            print(f"\n  {_ansi(chr(27)+'[38;5;141m')}🤖{label_str} Sub-agent working on: {prompt_preview}{C.RESET}",
+            _scroll_aware_print(f"\n  {_ansi(chr(27)+'[38;5;141m')}🤖{label_str} Sub-agent working on: {prompt_preview}{C.RESET}",
                   flush=True)
 
         # Build tool schemas for the sub-agent (only allowed tools)
@@ -3863,10 +4260,12 @@ class MultiAgentCoordinator:
             while not _heartbeat_stop.wait(10):
                 elapsed = time.time() - _hb_start
                 done = _done_count[0]
-                with _print_lock:
-                    msg = (f"  {_ansi(chr(27)+'[38;5;226m')}⏳ Parallel agents: "
-                           f"{done}/{total} done, {elapsed:.0f}s elapsed...{C.RESET}")
-                    print(f"\r{msg}   ", end="", flush=True)
+                _sr = _active_scroll_region
+                msg = (f"⏳ Parallel agents: "
+                       f"{done}/{total} done, {elapsed:.0f}s elapsed...")
+                _lock = _sr._lock if (_sr is not None and _sr._active) else _print_lock
+                with _lock:
+                    print(f"\r  {_ansi(chr(27)+'[38;5;226m')}{msg}{C.RESET}   ", end="", flush=True)
 
         hb_thread = threading.Thread(target=_heartbeat, daemon=True)
         hb_thread.start()
@@ -3883,7 +4282,9 @@ class MultiAgentCoordinator:
         _heartbeat_stop.set()
         hb_thread.join(timeout=2)
         # Clear heartbeat line
-        with _print_lock:
+        _sr = _active_scroll_region
+        _lock = _sr._lock if (_sr is not None and _sr._active) else _print_lock
+        with _lock:
             print(f"\r{' ' * 70}\r", end="", flush=True)
 
         # Mark timed-out agents
@@ -3944,7 +4345,7 @@ class ParallelAgentTool(Tool):
             tasks = tasks[:4]
 
         with _print_lock:
-            print(f"\n  {_ansi(chr(27)+'[38;5;141m')}🤖 Launching {len(tasks)} parallel agents...{C.RESET}",
+            _scroll_aware_print(f"\n  {_ansi(chr(27)+'[38;5;141m')}🤖 Launching {len(tasks)} parallel agents...{C.RESET}",
                   flush=True)
 
         results = self._coordinator.run_parallel(tasks)
@@ -3978,7 +4379,7 @@ class ParallelAgentTool(Tool):
         output_parts.append(summary)
 
         with _print_lock:
-            print(f"  {_ansi(chr(27)+'[38;5;141m')}🤖 All {len(results)} agents finished "
+            _scroll_aware_print(f"  {_ansi(chr(27)+'[38;5;141m')}🤖 All {len(results)} agents finished "
                   f"({succeeded} OK, {failed} failed, {total_time:.1f}s){C.RESET}",
                   flush=True)
 
@@ -4791,6 +5192,7 @@ class TUI:
         self._spinner_thread = None
         self.is_interactive = sys.stdin.isatty() and sys.stdout.isatty()
         self._is_cjk = self._detect_cjk_locale()
+        self.scroll_region = ScrollRegion()
         try:
             self._term_cols = shutil.get_terminal_size((80, 24)).columns
         except (ValueError, OSError):
@@ -4807,7 +5209,7 @@ class TUI:
                     "/help", "/exit", "/quit", "/q", "/clear", "/model", "/models",
                     "/status", "/save", "/compact", "/yes", "/no", "/tokens",
                     "/commit", "/diff", "/git", "/plan", "/approve", "/act",
-                    "/execute", "/undo", "/init", "/config", "/debug",
+                    "/execute", "/undo", "/init", "/config", "/debug", "/debug-scroll",
                     "/checkpoint", "/rollback", "/autotest", "/watch", "/skills",
                 ]
                 def _completer(text, state):
@@ -4821,6 +5223,19 @@ class TUI:
                 readline.parse_and_bind("tab: complete")
             except Exception:
                 pass
+
+    def _scroll_print(self, *args, **kwargs):
+        """Print within the scroll region (or normal print if inactive).
+        When scroll region is active, acquires its lock to prevent text from
+        being written while the cursor is in the footer area (during status updates).
+        DECSTBM handles auto-scrolling — the cursor stays in the scroll region."""
+        sr = self.scroll_region
+        if sr._active:
+            with sr._lock:
+                print(*args, **kwargs)
+                sys.stdout.flush()
+        else:
+            print(*args, **kwargs)
 
     def banner(self, config, model_ok=True):
         """Print spectacular startup banner — vaporwave/neon aesthetic.
@@ -4996,48 +5411,57 @@ class TUI:
         - Single Enter to submit in non-CJK mode
         prefill: pre-populate the input line with type-ahead text.
         """
-        first_line = self.get_input(session=session, plan_mode=plan_mode, prefill=prefill)
-        if first_line is None:
-            return None
-        if first_line.strip() == '"""':
-            # Explicit multi-line mode
-            lines = []
-            print(f"{C.DIM}  (multi-line input, end with \"\"\" on its own line){C.RESET}")
-            while True:
-                try:
-                    line = input(f"{C.DIM}...{C.RESET} ")
-                    if line.strip() == '"""':
-                        break
-                    lines.append(line)
-                except (EOFError, KeyboardInterrupt):
-                    print(f"\n{C.DIM}(Cancelled){C.RESET}")
-                    return None
-            return "\n".join(lines)
+        # Keep DECSTBM active during input — footer stays visible.
+        # Input/readline works within the scroll region (rows 1..scroll_end).
+        _sr = self.scroll_region
+        _sr_was_active = _sr._active
 
-        # IME-safe mode: if input looks like it might continue
-        # (CJK locale and line doesn't end with command prefix),
-        # allow continuation with Enter, empty line sends
-        if (self._is_cjk and
-                first_line.strip() and
-                not first_line.strip().startswith("/")):
-            # Show subtle hint on first use
-            if not hasattr(self, '_ime_hint_shown'):
-                self._ime_hint_shown = True
-                print(f"{C.DIM}  (IME mode: press Enter on empty line to send, \"\"\" for multiline){C.RESET}")
-            lines = [first_line]
-            while True:
-                try:
-                    cont = input(f"{C.DIM}...{C.RESET} ")
-                    if cont.strip() == "":
-                        # Empty line = send
-                        break
-                    lines.append(cont)
-                except (EOFError, KeyboardInterrupt):
-                    print(f"\n{C.DIM}(Cancelled){C.RESET}")
-                    return None
-            return "\n".join(lines)
+        try:
+            first_line = self.get_input(session=session, plan_mode=plan_mode, prefill=prefill)
+            if first_line is None:
+                return None
+            if first_line.strip() == '"""':
+                # Explicit multi-line mode
+                lines = []
+                print(f"{C.DIM}  (multi-line input, end with \"\"\" on its own line){C.RESET}")
+                while True:
+                    try:
+                        line = input(f"{C.DIM}...{C.RESET} ")
+                        if line.strip() == '"""':
+                            break
+                        lines.append(line)
+                    except (EOFError, KeyboardInterrupt):
+                        print(f"\n{C.DIM}(Cancelled){C.RESET}")
+                        return None
+                return "\n".join(lines)
 
-        return first_line
+            # IME-safe mode: if input looks like it might continue
+            # (CJK locale and line doesn't end with command prefix),
+            # allow continuation with Enter, empty line sends
+            if (self._is_cjk and
+                    first_line.strip() and
+                    not first_line.strip().startswith("/")):
+                # Show subtle hint on first use
+                if not hasattr(self, '_ime_hint_shown'):
+                    self._ime_hint_shown = True
+                    print(f"{C.DIM}  (IME mode: press Enter on empty line to send, \"\"\" for multiline){C.RESET}")
+                lines = [first_line]
+                while True:
+                    try:
+                        cont = input(f"{C.DIM}...{C.RESET} ")
+                        if cont.strip() == "":
+                            # Empty line = send
+                            break
+                        lines.append(cont)
+                    except (EOFError, KeyboardInterrupt):
+                        print(f"\n{C.DIM}(Cancelled){C.RESET}")
+                        return None
+                return "\n".join(lines)
+
+            return first_line
+        finally:
+            # Scroll region stays active — no teardown/setup needed.
+            pass
 
     def stream_response(self, response_iter):
         """Stream LLM response to terminal. Returns (text, tool_calls).
@@ -5058,6 +5482,31 @@ class TUI:
         _last_status_update = 0.0
         _status_line_shown = False
         _status_line_len = 60  # track length for clean clearing
+        _sr = self.scroll_region  # reference (not cached bool)
+
+        def _update_thinking_status():
+            nonlocal _status_line_shown, _status_line_len, _last_status_update
+            _now = time.time()
+            if not self.is_interactive or header_printed or (_now - _last_status_update) < 0.5:
+                return
+            _elapsed = _now - _stream_start
+            _tok_display = f"{_approx_tokens / 1000:.1f}k" if _approx_tokens >= 1000 else str(_approx_tokens)
+            _status_msg = f"\U0001f4ad Thinking... ({_elapsed:.0f}s \u00b7 \u2193 {_tok_display} tokens)"
+            _clear_w = max(len(_status_msg) + 6, 60)
+            _lock = _sr._lock if _sr._active else _print_lock
+            with _lock:
+                print(f"\r  {_status_msg}{' ' * 4}", end="", flush=True)
+            _status_line_shown = True
+            _status_line_len = _clear_w
+            _last_status_update = _now
+
+        def _clear_thinking_status():
+            nonlocal _status_line_shown
+            if _status_line_shown:
+                _lock = _sr._lock if _sr._active else _print_lock
+                with _lock:
+                    print(f"\r{' ' * _status_line_len}\r", end="", flush=True)
+                _status_line_shown = False
 
         for chunk in response_iter:
             choice = chunk.get("choices", [{}])[0]
@@ -5073,40 +5522,22 @@ class TUI:
                     acc["id"] = tc_delta["id"]
                 func_delta = tc_delta.get("function", {})
                 if func_delta.get("name"):
-                    acc["function"]["name"] += func_delta["name"]
+                    _fn = func_delta["name"]
+                    acc["function"]["name"] += _fn if isinstance(_fn, str) else str(_fn)
                 if func_delta.get("arguments"):
-                    acc["function"]["arguments"] += func_delta["arguments"]
+                    _fa = func_delta["arguments"]
+                    acc["function"]["arguments"] += _fa if isinstance(_fa, str) else str(_fa)
 
             content = delta.get("content", "")
             if not content:
-                # Even without content, update status line periodically (interactive only)
-                _now = time.time()
-                if self.is_interactive and not header_printed and (_now - _last_status_update) >= 0.5:
-                    _elapsed = _now - _stream_start
-                    _tok_display = f"{_approx_tokens / 1000:.1f}k" if _approx_tokens >= 1000 else str(_approx_tokens)
-                    _status_msg = f"  \U0001f4ad Thinking... ({_elapsed:.0f}s \u00b7 \u2193 {_tok_display} tokens)"
-                    _clear_w = max(len(_status_msg) + 4, 60)
-                    print(f"\r{_status_msg}{' ' * 4}", end="", flush=True)
-                    _status_line_shown = True
-                    _status_line_len = _clear_w
-                    _last_status_update = _now
+                _update_thinking_status()
                 continue
             # Approximate token count: ~4 chars per token
             _approx_tokens += len(content) // 4 or 1
             raw_parts.append(content)
             think_buf += content
 
-            # Update status line while in think mode or before header printed (interactive only)
-            _now = time.time()
-            if self.is_interactive and not header_printed and (_now - _last_status_update) >= 0.5:
-                _elapsed = _now - _stream_start
-                _tok_display = f"{_approx_tokens / 1000:.1f}k" if _approx_tokens >= 1000 else str(_approx_tokens)
-                _status_msg = f"  \U0001f4ad Thinking... ({_elapsed:.0f}s \u00b7 \u2193 {_tok_display} tokens)"
-                _clear_w = max(len(_status_msg) + 4, 60)
-                print(f"\r{_status_msg}{' ' * 4}", end="", flush=True)
-                _status_line_shown = True
-                _status_line_len = _clear_w
-                _last_status_update = _now
+            _update_thinking_status()
 
             # State machine: detect <think> and </think> tags even split across chunks
             while True:
@@ -5123,24 +5554,20 @@ class TUI:
                             to_print = ""
                         if to_print:
                             if not header_printed:
-                                if _status_line_shown:
-                                    print(f"\r{' ' * _status_line_len}\r", end="", flush=True)
-                                    _status_line_shown = False
-                                print(f"\n{C.BBLUE}assistant{C.RESET}: ", end="", flush=True)
+                                _clear_thinking_status()
+                                self._scroll_print(f"\n{C.BBLUE}assistant{C.RESET}: ", end="", flush=True)
                                 header_printed = True
-                            print(to_print, end="", flush=True)
+                            self._scroll_print(to_print, end="", flush=True)
                         break
                     else:
                         # Print text before <think>
                         to_print = think_buf[:idx]
                         if to_print:
                             if not header_printed:
-                                if _status_line_shown:
-                                    print(f"\r{' ' * _status_line_len}\r", end="", flush=True)
-                                    _status_line_shown = False
-                                print(f"\n{C.BBLUE}assistant{C.RESET}: ", end="", flush=True)
+                                _clear_thinking_status()
+                                self._scroll_print(f"\n{C.BBLUE}assistant{C.RESET}: ", end="", flush=True)
                                 header_printed = True
-                            print(to_print, end="", flush=True)
+                            self._scroll_print(to_print, end="", flush=True)
                         think_buf = think_buf[idx + 7:]  # skip past <think>
                         in_think = True
                 else:
@@ -5155,24 +5582,22 @@ class TUI:
                         in_think = False
 
         # Clear status line before final output
-        if _status_line_shown:
-            print(f"\r{' ' * _status_line_len}\r", end="", flush=True)
-            _status_line_shown = False
+        _clear_thinking_status()
 
         # Flush remaining buffer
         if think_buf and not in_think:
             if not header_printed:
-                print(f"\n{C.BBLUE}assistant{C.RESET}: ", end="", flush=True)
+                self._scroll_print(f"\n{C.BBLUE}assistant{C.RESET}: ", end="", flush=True)
                 header_printed = True
-            print(think_buf, end="", flush=True)
+            self._scroll_print(think_buf, end="", flush=True)
 
         if not header_printed:
-            print(f"\n{C.BBLUE}assistant{C.RESET}: ", end="", flush=True)
+            self._scroll_print(f"\n{C.BBLUE}assistant{C.RESET}: ", end="", flush=True)
 
         full_text = "".join(raw_parts)
         # Strip <think>...</think> from final text for history
         full_text = re.sub(r'<think>[\s\S]*?</think>', '', full_text).strip()
-        print()  # newline
+        self._scroll_print()  # newline
 
         # Build tool_calls list from accumulated deltas
         streamed_tool_calls = []
@@ -5208,14 +5633,15 @@ class TUI:
 
         # Display text
         if content.strip():
-            print(f"\n{C.BBLUE}assistant{C.RESET}: ", end="")
+            self._scroll_print(f"\n{C.BBLUE}assistant{C.RESET}: ", end="")
             self._render_markdown(content)
-            print()
+            self._scroll_print()
 
         return content, tool_calls
 
     def _render_markdown(self, text):
         """Simple markdown-ish rendering for terminal."""
+        _p = self._scroll_print
         in_code_block = False
         lines = text.split("\n")
         for i, line in enumerate(lines):
@@ -5224,29 +5650,29 @@ class TUI:
                 if in_code_block:
                     lang = line[3:].strip()
                     sep_w = min(40, _get_terminal_width() - 6)
-                    print(f"\n{C.DIM}{'─' * sep_w} {lang}{C.RESET}")
+                    _p(f"\n{C.DIM}{'─' * sep_w} {lang}{C.RESET}")
                 else:
                     sep_w = min(40, _get_terminal_width() - 6)
-                    print(f"{C.DIM}{'─' * sep_w}{C.RESET}")
+                    _p(f"{C.DIM}{'─' * sep_w}{C.RESET}")
                 continue
 
             if in_code_block:
-                print(f"{C.GREEN}{line}{C.RESET}")
+                _p(f"{C.GREEN}{line}{C.RESET}")
                 continue
 
             # Headers
             if line.startswith("### "):
-                print(f"{C.BOLD}{C.CYAN}{line[4:]}{C.RESET}")
+                _p(f"{C.BOLD}{C.CYAN}{line[4:]}{C.RESET}")
             elif line.startswith("## "):
-                print(f"{C.BOLD}{C.BCYAN}{line[3:]}{C.RESET}")
+                _p(f"{C.BOLD}{C.BCYAN}{line[3:]}{C.RESET}")
             elif line.startswith("# "):
-                print(f"{C.BOLD}{C.BMAGENTA}{line[2:]}{C.RESET}")
+                _p(f"{C.BOLD}{C.BMAGENTA}{line[2:]}{C.RESET}")
             else:
                 # Inline code
                 rendered = re.sub(r'`([^`]+)`', f'{C.GREEN}\\1{C.RESET}', line)
                 # Bold
                 rendered = re.sub(r'\*\*([^*]+)\*\*', f'{C.BOLD}\\1{C.RESET}', rendered)
-                print(rendered)
+                _p(rendered)
 
     # Tool icons with neon color
     @staticmethod
@@ -5267,6 +5693,7 @@ class TUI:
     def show_tool_call(self, name, params):
         """Display a tool call being made with Claude Code-style formatting."""
         self.stop_spinner()
+        _p = self._scroll_print
         icon, color = self._tool_icons().get(name, ("🔧", C.YELLOW))
         self._term_cols = _get_terminal_width()  # refresh on each call
         max_display = self._term_cols - 10
@@ -5274,7 +5701,7 @@ class TUI:
         if name == "Bash":
             cmd = params.get("command", "")
             display = cmd if len(cmd) <= max_display else cmd[:max_display - 3] + "..."
-            print(f"\n  {color}{icon} {name}{C.RESET} {_ansi(chr(27)+'[38;5;240m')}→{C.RESET} {C.WHITE}{display}{C.RESET}")
+            _p(f"\n  {color}{icon} {name}{C.RESET} {_ansi(chr(27)+'[38;5;240m')}→{C.RESET} {C.WHITE}{display}{C.RESET}")
         elif name == "Read":
             path = params.get("file_path", "")
             offset = params.get("offset")
@@ -5285,21 +5712,21 @@ class TUI:
                 end = start + (limit or 2000) - 1
                 range_str = f" {_ansi(chr(27)+'[38;5;240m')}(L{start}-{end}){C.RESET}"
             path_display = path if len(path) <= max_display else "..." + path[-(max_display-3):]
-            print(f"\n  {color}{icon} {name}{C.RESET} {_ansi(chr(27)+'[38;5;240m')}→{C.RESET} {C.WHITE}{path_display}{C.RESET}{range_str}")
+            _p(f"\n  {color}{icon} {name}{C.RESET} {_ansi(chr(27)+'[38;5;240m')}→{C.RESET} {C.WHITE}{path_display}{C.RESET}{range_str}")
         elif name == "Write":
             path = params.get("file_path", "")
             content = params.get("content", "")
             lines = content.count("\n") + (1 if content else 0)
             path_display = path if len(path) <= max_display else "..." + path[-(max_display-3):]
-            print(f"\n  {color}{icon} {name}{C.RESET} {_ansi(chr(27)+'[38;5;240m')}→{C.RESET} {C.WHITE}{path_display}{C.RESET}"
-                  f" {_ansi(chr(27)+'[38;5;46m')}(+{lines} lines){C.RESET}")
+            _p(f"\n  {color}{icon} {name}{C.RESET} {_ansi(chr(27)+'[38;5;240m')}→{C.RESET} {C.WHITE}{path_display}{C.RESET}"
+               f" {_ansi(chr(27)+'[38;5;46m')}(+{lines} lines){C.RESET}")
         elif name == "Edit":
             path = params.get("file_path", "")
             old = params.get("old_string", "")
             new = params.get("new_string", "")
             path_display = path if len(path) <= max_display else "..." + path[-(max_display-3):]
             # Show diff-style preview
-            print(f"\n  {color}{icon} {name}{C.RESET} {_ansi(chr(27)+'[38;5;240m')}→{C.RESET} {C.WHITE}{path_display}{C.RESET}")
+            _p(f"\n  {color}{icon} {name}{C.RESET} {_ansi(chr(27)+'[38;5;240m')}→{C.RESET} {C.WHITE}{path_display}{C.RESET}")
             # Show abbreviated old/new for review
             old_first = old.split('\n')[0] if old else ""
             new_first = new.split('\n')[0] if new else ""
@@ -5308,38 +5735,38 @@ class TUI:
             old_truncated = len(old_first) > 60 or '\n' in old
             new_truncated = len(new_first) > 60 or '\n' in new
             if old_preview:
-                print(f"  {_ansi(chr(27)+'[38;5;196m')}  - {old_preview}{'...' if old_truncated else ''}{C.RESET}")
+                _p(f"  {_ansi(chr(27)+'[38;5;196m')}  - {old_preview}{'...' if old_truncated else ''}{C.RESET}")
             if new_preview:
-                print(f"  {_ansi(chr(27)+'[38;5;46m')}  + {new_preview}{'...' if new_truncated else ''}{C.RESET}")
+                _p(f"  {_ansi(chr(27)+'[38;5;46m')}  + {new_preview}{'...' if new_truncated else ''}{C.RESET}")
         elif name in ("Glob", "Grep"):
             pat = params.get("pattern", "")
             search_path = params.get("path", "")
             extra = f" {_ansi(chr(27)+'[38;5;240m')}in {search_path}{C.RESET}" if search_path else ""
-            print(f"\n  {color}{icon} {name}{C.RESET} {_ansi(chr(27)+'[38;5;240m')}→{C.RESET} {C.WHITE}{pat}{C.RESET}{extra}")
+            _p(f"\n  {color}{icon} {name}{C.RESET} {_ansi(chr(27)+'[38;5;240m')}→{C.RESET} {C.WHITE}{pat}{C.RESET}{extra}")
         elif name == "WebFetch":
             url = params.get("url", "")
             url_display = url if len(url) <= max_display else url[:max_display - 3] + "..."
-            print(f"\n  {color}{icon} {name}{C.RESET} {_ansi(chr(27)+'[38;5;240m')}→{C.RESET} {C.WHITE}{url_display}{C.RESET}")
+            _p(f"\n  {color}{icon} {name}{C.RESET} {_ansi(chr(27)+'[38;5;240m')}→{C.RESET} {C.WHITE}{url_display}{C.RESET}")
         elif name == "WebSearch":
             query = params.get("query", "")
-            print(f"\n  {color}{icon} {name}{C.RESET} {_ansi(chr(27)+'[38;5;240m')}→{C.RESET} {C.WHITE}\"{query}\"{C.RESET}")
+            _p(f"\n  {color}{icon} {name}{C.RESET} {_ansi(chr(27)+'[38;5;240m')}→{C.RESET} {C.WHITE}\"{query}\"{C.RESET}")
         elif name == "NotebookEdit":
             path = params.get("notebook_path", "")
             mode = params.get("edit_mode", "replace")
             cell = params.get("cell_number", 0)
-            print(f"\n  {color}{icon} {name}{C.RESET} {_ansi(chr(27)+'[38;5;240m')}→{C.RESET} "
-                  f"{C.WHITE}{path}{C.RESET} {_ansi(chr(27)+'[38;5;240m')}(cell {cell}, {mode}){C.RESET}")
+            _p(f"\n  {color}{icon} {name}{C.RESET} {_ansi(chr(27)+'[38;5;240m')}→{C.RESET} "
+               f"{C.WHITE}{path}{C.RESET} {_ansi(chr(27)+'[38;5;240m')}(cell {cell}, {mode}){C.RESET}")
         elif name == "SubAgent":
             prompt = params.get("prompt", "")
             max_t = params.get("max_turns", 10)
             allow_w = params.get("allow_writes", False)
             prompt_display = prompt if len(prompt) <= max_display else prompt[:max_display - 3] + "..."
             mode_str = "rw" if allow_w else "ro"
-            print(f"\n  {color}{icon} {name}{C.RESET} {_ansi(chr(27)+'[38;5;240m')}→{C.RESET} "
-                  f"{C.WHITE}{prompt_display}{C.RESET} "
-                  f"{_ansi(chr(27)+'[38;5;240m')}(turns:{max_t}, {mode_str}){C.RESET}")
+            _p(f"\n  {color}{icon} {name}{C.RESET} {_ansi(chr(27)+'[38;5;240m')}→{C.RESET} "
+               f"{C.WHITE}{prompt_display}{C.RESET} "
+               f"{_ansi(chr(27)+'[38;5;240m')}(turns:{max_t}, {mode_str}){C.RESET}")
         else:
-            print(f"\n  {color}{icon} {name}{C.RESET}")
+            _p(f"\n  {color}{icon} {name}{C.RESET}")
 
     def show_tool_result(self, name, result, is_error=False, duration=None, params=None):
         """Display tool result with compact single-line summary + optional detail."""
@@ -5416,9 +5843,10 @@ class TUI:
             err_suffix = f" {summary}"
 
         # Print compact summary line
-        print(f"  {icon_color}{icon_char}{C.RESET} {name}{_dim}{key_arg}{C.RESET}{_dim}{paren}{C.RESET}"
-              f"{_red}{err_suffix}{C.RESET}" if is_error else
-              f"  {icon_color}{icon_char}{C.RESET} {name}{_dim}{key_arg}{C.RESET}{_dim}{paren}{C.RESET}")
+        _p = self._scroll_print
+        _p(f"  {icon_color}{icon_char}{C.RESET} {name}{_dim}{key_arg}{C.RESET}{_dim}{paren}{C.RESET}"
+           f"{_red}{err_suffix}{C.RESET}" if is_error else
+           f"  {icon_color}{icon_char}{C.RESET} {name}{_dim}{key_arg}{C.RESET}{_dim}{paren}{C.RESET}")
 
         # Show first 3 lines of detail with ┃ prefix (collapsed by default)
         detail_marker = _dim + "  \u2503"
@@ -5427,14 +5855,17 @@ class TUI:
             shown = min(max_detail, line_count)
             for line in lines[:shown]:
                 display = _truncate_to_display_width(line, 200)
-                print(f"{detail_marker} {_dim}{display}{C.RESET}")
+                _p(f"{detail_marker} {_dim}{display}{C.RESET}")
             if line_count > max_detail:
                 remaining = line_count - max_detail
-                print(f"{detail_marker} {_ansi(chr(27)+'[38;5;245m')}  \u2195 {remaining} more lines{C.RESET}")
+                _p(f"{detail_marker} {_ansi(chr(27)+'[38;5;245m')}  \u2195 {remaining} more lines{C.RESET}")
 
     def ask_permission(self, tool_name, params):
         """Ask user for permission — Claude Code style prompt."""
         icon, color = self._tool_icons().get(tool_name, ("🔧", C.YELLOW))
+
+        # Stop any running spinner/timer before prompting (prevents \r collision)
+        self.stop_spinner()
 
         # Show full command/detail (no truncation for security review)
         detail = ""
@@ -5492,22 +5923,25 @@ class TUI:
         # C4: Stop any existing spinner before starting new one
         self.stop_spinner()
         self._spinner_stop.clear()
+        _sr = self.scroll_region
         # Use ASCII spinner frames when colors are disabled (screen readers, dumb terminals)
         frames = ["|", "/", "-", "\\"] if not C._enabled else ["◜", "◠", "◝", "◞", "◡", "◟"]
         colors = [_ansi("\033[38;5;51m"), _ansi("\033[38;5;87m"), _ansi("\033[38;5;123m"),
                   _ansi("\033[38;5;159m"), _ansi("\033[38;5;123m"), _ansi("\033[38;5;87m")]
-        clear_len = len(label) + 10  # enough to clear the spinner line
+        clear_len = max(len(label) + 10, 60)  # enough to clear the spinner line
 
         def spin():
             i = 0
             while not self._spinner_stop.is_set():
                 c = colors[i % len(colors)]
                 f = frames[i % len(frames)]
-                with _print_lock:
+                _lock = _sr._lock if _sr._active else _print_lock
+                with _lock:
                     print(f"\r  {c}{f} {label}...{C.RESET}", end="", flush=True)
                 i += 1
                 self._spinner_stop.wait(0.08)  # replaces time.sleep
-            with _print_lock:
+            _lock = _sr._lock if _sr._active else _print_lock
+            with _lock:
                 print(f"\r{' ' * clear_len}\r", end="", flush=True)
 
         self._spinner_thread = threading.Thread(target=spin, daemon=True)
@@ -5529,18 +5963,22 @@ class TUI:
         self._spinner_stop.clear()
         _icon, _color = self._tool_icons().get(tool_name, ("\U0001f527", C.YELLOW))
         _start = time.time()
+        _sr = self.scroll_region
 
         def _update():
             _clear_len = 60
             while not self._spinner_stop.is_set():
                 elapsed = time.time() - _start
-                msg = f"  {_icon} Running {tool_name}... ({elapsed:.0f}s)"
-                _clear_len = max(_clear_len, len(msg) + 4)
-                with _print_lock:
-                    print(f"\r{msg}   ", end="", flush=True)
+                msg = f"{_icon} Running {tool_name}... ({elapsed:.0f}s)"
+                _padded = f"  {msg}"
+                _clear_len = max(_clear_len, len(_padded) + 4)
+                _lock = _sr._lock if _sr._active else _print_lock
+                with _lock:
+                    print(f"\r{_padded}   ", end="", flush=True)
                 self._spinner_stop.wait(1.0)
             # Clear the status line
-            with _print_lock:
+            _lock = _sr._lock if _sr._active else _print_lock
+            with _lock:
                 print(f"\r{' ' * _clear_len}\r", end="", flush=True)
 
         self._spinner_thread = threading.Thread(target=_update, daemon=True)
@@ -5579,6 +6017,7 @@ class TUI:
   {_c198}/yes{C.RESET}               Auto-approve ON
   {_c198}/no{C.RESET}                Auto-approve OFF
   {_c198}/debug{C.RESET}             Toggle debug mode
+  {_c198}/debug-scroll{C.RESET}      Test scroll region (DECSTBM)
   {_c198}/resume{C.RESET}            Switch to a different session
   {_c198}\"\"\"{C.RESET}                Multi-line input
   {_c51}━━ Git {sep[6:]}{C.RESET}
@@ -5707,6 +6146,8 @@ class Agent:
 
     def run(self, user_input):
         """Run the agent loop for a single user request."""
+        _p = self.tui._scroll_print  # scroll-region-safe print
+
         # Auto-parallel detection: if user asks multiple independent tasks, run them in parallel
         if not self._plan_mode:
             parallel_tasks = self._detect_parallel_tasks(user_input)
@@ -5715,12 +6156,12 @@ class Agent:
                 if pa_tool:
                     self.session.add_user_message(user_input)
                     tasks_payload = [{"prompt": t, "max_turns": 10} for t in parallel_tasks]
-                    print(f"\n  {_ansi(chr(27)+'[38;5;226m')}⚡ Auto-detected {len(parallel_tasks)} parallel tasks{C.RESET}")
+                    _p(f"\n  {_ansi(chr(27)+'[38;5;226m')}⚡ Auto-detected {len(parallel_tasks)} parallel tasks{C.RESET}")
                     result = pa_tool.execute({"tasks": tasks_payload})
                     self.session.add_assistant_message(result, [])
-                    print(f"\n{C.BBLUE}assistant{C.RESET}: ", end="")
+                    _p(f"\n{C.BBLUE}assistant{C.RESET}: ", end="")
                     self.tui._render_markdown(result)
-                    print()
+                    _p()
                     return
 
         self.session.add_user_message(user_input)
@@ -5729,14 +6170,20 @@ class Agent:
         _empty_retries = 0     # cap empty response retries
         _start_time = time.time()
 
-        # ESC key monitor for real-time interrupt
-        _esc_monitor = InputMonitor()
+        # Check if scroll region is already active (managed by main loop)
+        _scroll_mode = self.tui.scroll_region._active
+
+        # ESC key monitor for real-time interrupt (with type-ahead → scroll region hint)
+        def _on_typeahead(text):
+            if self.tui.scroll_region._active:
+                self.tui.scroll_region.update_hint(text)
+        _esc_monitor = InputMonitor(on_typeahead=_on_typeahead if _scroll_mode else None)
         _esc_monitor.start()
 
         for iteration in range(self.MAX_ITERATIONS):
             if self._interrupted.is_set() or _esc_monitor.pressed:
                 if _esc_monitor.pressed:
-                    print(f"\n{C.YELLOW}Stopped (ESC pressed).{C.RESET}")
+                    _p(f"\n{C.YELLOW}Stopped (ESC pressed).{C.RESET}")
                     self._interrupted.set()
                 break
 
@@ -5748,7 +6195,7 @@ class Agent:
                     if fw_changes:
                         fw_msg = self.file_watcher.format_changes(fw_changes)
                         self.session.add_system_note(fw_msg)
-                        print(f"\n  {_ansi(chr(27)+'[38;5;226m')}👁 {len(fw_changes)} file change(s) detected{C.RESET}")
+                        _p(f"\n  {_ansi(chr(27)+'[38;5;226m')}👁 {len(fw_changes)} file change(s) detected{C.RESET}")
 
                 # 1. Call Ollama (with retry for malformed responses)
                 tools = self.registry.get_schemas()
@@ -5788,8 +6235,8 @@ class Agent:
                 self.tui.stop_spinner()
 
                 if response is None:
-                    print(f"\n{C.RED}The AI didn't respond. It may still be loading or ran out of memory.{C.RESET}")
-                    print(f"{C.DIM}Try again, or restart Ollama if this keeps happening.{C.RESET}")
+                    _p(f"\n{C.RED}The AI didn't respond. It may still be loading or ran out of memory.{C.RESET}")
+                    _p(f"{C.DIM}Try again, or restart Ollama if this keeps happening.{C.RESET}")
                     break
 
                 # 2. Parse response
@@ -5819,16 +6266,16 @@ class Agent:
                     completion_t = usage.get("completion_tokens", 0)
                     if prompt_t or completion_t:
                         pct = min(int(((prompt_t + completion_t) / self.config.context_window) * 100), 100)
-                        print(f"  {_ansi(chr(27)+'[38;5;240m')}tokens: {prompt_t}→{completion_t} "
-                              f"({pct}% ctx){C.RESET}")
+                        _p(f"  {_ansi(chr(27)+'[38;5;240m')}tokens: {prompt_t}→{completion_t} "
+                           f"({pct}% ctx){C.RESET}")
                 self.session._just_compacted = False
 
                 # Handle empty response from local LLM (retry with backoff, max 3)
                 if not text and not tool_calls and iteration < self.MAX_ITERATIONS - 1:
                     _empty_retries += 1
                     if _empty_retries > 3:
-                        print(f"\n{C.YELLOW}The AI returned empty responses (the model may be overloaded or incompatible).{C.RESET}")
-                        print(f"{C.DIM}Try rephrasing, or switch models with: /model <name>{C.RESET}")
+                        _p(f"\n{C.YELLOW}The AI returned empty responses (the model may be overloaded or incompatible).{C.RESET}")
+                        _p(f"{C.DIM}Try rephrasing, or switch models with: /model <name>{C.RESET}")
                         break
                     if self.config.debug:
                         print(f"{C.DIM}[debug] Empty response (retry {_empty_retries}/3), backing off...{C.RESET}", file=sys.stderr)
@@ -5856,8 +6303,8 @@ class Agent:
                 if len(_recent_tool_calls) >= self.MAX_SAME_TOOL_REPEAT:
                     recent = _recent_tool_calls[-self.MAX_SAME_TOOL_REPEAT:]
                     if all(r == recent[0] for r in recent):
-                        print(f"\n{C.YELLOW}The AI got stuck repeating the same action. Stopped.{C.RESET}")
-                        print(f"{C.DIM}Try rephrasing your request or asking for a different approach.{C.RESET}")
+                        _p(f"\n{C.YELLOW}The AI got stuck repeating the same action. Stopped.{C.RESET}")
+                        _p(f"{C.DIM}Try rephrasing your request or asking for a different approach.{C.RESET}")
                         break
                 if len(_recent_tool_calls) > 10:
                     _recent_tool_calls = _recent_tool_calls[-10:]
@@ -5997,9 +6444,9 @@ class Agent:
                                 if fpath:
                                     test_errors = self.auto_test.run_after_edit(fpath)
                                     if test_errors:
-                                        print(f"\n  {_ansi(chr(27)+'[38;5;196m')}Auto-test errors detected:{C.RESET}")
+                                        _p(f"\n  {_ansi(chr(27)+'[38;5;196m')}Auto-test errors detected:{C.RESET}")
                                         for line in test_errors.split('\n')[:5]:
-                                            print(f"  {C.DIM}{line}{C.RESET}")
+                                            _p(f"  {C.DIM}{line}{C.RESET}")
                                         # Feed errors back as additional context
                                         results.append(ToolResult(
                                             f"autotest_{tc_id}",
@@ -6041,7 +6488,7 @@ class Agent:
                 after_tokens = self.session.get_token_estimate()
                 if after_tokens < before_tokens * 0.9:  # significant compaction happened
                     pct = min(int((after_tokens / self.config.context_window) * 100), 100)
-                    print(f"\n  {_ansi(chr(27)+'[38;5;226m')}⚡ Auto-compacted: {before_tokens}→{after_tokens} tokens ({pct}% used){C.RESET}")
+                    _p(f"\n  {_ansi(chr(27)+'[38;5;226m')}⚡ Auto-compacted: {before_tokens}→{after_tokens} tokens ({pct}% used){C.RESET}")
 
                 # Loop: LLM will be called again to process tool results
 
@@ -6051,7 +6498,7 @@ class Agent:
                     response.close()
                 if text:
                     self.session.add_assistant_message(text)
-                print(f"\n{C.YELLOW}Interrupted.{C.RESET}")
+                _p(f"\n{C.YELLOW}Interrupted.{C.RESET}")
                 self._interrupted.set()
                 break
             except urllib.error.HTTPError as e:
@@ -6070,12 +6517,12 @@ class Agent:
                         e.close()
                     except Exception:
                         pass
-                print(f"\n{C.RED}HTTP {e.code} {e.reason}: {body}{C.RESET}")
+                _p(f"\n{C.RED}HTTP {e.code} {e.reason}: {body}{C.RESET}")
                 if e.code == 404:
-                    print(f"{C.DIM}The model '{self.config.model}' may not be downloaded yet.{C.RESET}")
-                    print(f"{C.DIM}Download it:  ollama pull {self.config.model}{C.RESET}")
+                    _p(f"{C.DIM}The model '{self.config.model}' may not be downloaded yet.{C.RESET}")
+                    _p(f"{C.DIM}Download it:  ollama pull {self.config.model}{C.RESET}")
                 elif e.code == 400:
-                    print(f"{C.DIM}The request was rejected — the model name or context may be invalid.{C.RESET}")
+                    _p(f"{C.DIM}The request was rejected — the model name or context may be invalid.{C.RESET}")
                 break
             except urllib.error.URLError as e:
                 self.tui.stop_spinner()
@@ -6083,9 +6530,9 @@ class Agent:
                     response.close()
                 if text:
                     self.session.add_assistant_message(text)
-                print(f"\n{C.RED}Lost connection to Ollama (the local AI engine).{C.RESET}")
-                print(f"{C.DIM}It may have crashed or been closed. Restart it:  ollama serve{C.RESET}")
-                print(f"{C.DIM}Your conversation is still here — just try again after restarting.{C.RESET}")
+                _p(f"\n{C.RED}Lost connection to Ollama (the local AI engine).{C.RESET}")
+                _p(f"{C.DIM}It may have crashed or been closed. Restart it:  ollama serve{C.RESET}")
+                _p(f"{C.DIM}Your conversation is still here — just try again after restarting.{C.RESET}")
                 break
             except Exception as e:
                 self.tui.stop_spinner()
@@ -6093,19 +6540,19 @@ class Agent:
                     response.close()
                 if text:
                     self.session.add_assistant_message(text)
-                print(f"\n{C.RED}Something went wrong: {e}{C.RESET}")
-                print(f"{C.DIM}Your conversation is still active. Try your request again.{C.RESET}")
+                _p(f"\n{C.RED}Something went wrong: {e}{C.RESET}")
+                _p(f"{C.DIM}Your conversation is still active. Try your request again.{C.RESET}")
                 if self.config.debug:
                     traceback.print_exc()
                 else:
-                    print(f"{C.DIM}(Run with --debug for full details){C.RESET}")
+                    _p(f"{C.DIM}(Run with --debug for full details){C.RESET}")
                 break
         else:
-            print(f"\n{C.YELLOW}The AI took {self.MAX_ITERATIONS} steps without finishing.{C.RESET}")
-            print(f"{C.DIM}Your work so far is saved. Try breaking the task into smaller steps,{C.RESET}")
-            print(f"{C.DIM}or type /compact to free up context and continue.{C.RESET}")
+            _p(f"\n{C.YELLOW}The AI took {self.MAX_ITERATIONS} steps without finishing.{C.RESET}")
+            _p(f"{C.DIM}Your work so far is saved. Try breaking the task into smaller steps,{C.RESET}")
+            _p(f"{C.DIM}or type /compact to free up context and continue.{C.RESET}")
 
-        # Always stop ESC monitor and restore terminal
+        # Stop ESC monitor (scroll region stays active — managed by main loop)
         self._last_typeahead = _esc_monitor.get_typeahead()
         _esc_monitor.stop()
 
@@ -6290,6 +6737,10 @@ def main():
         raise KeyboardInterrupt
     signal.signal(signal.SIGINT, signal_handler)
 
+    # Handle terminal resize — update scroll region
+    if hasattr(signal, 'SIGWINCH'):
+        signal.signal(signal.SIGWINCH, lambda s, f: tui.scroll_region.resize())
+
     # Helper: show last user message from session for "welcome back"
     def _show_resume_info(label, msgs, pct, messages_list):
         print(f"\n  {_ansi(chr(27)+'[38;5;51m')}✦ Welcome back! Resumed {label}{C.RESET}")
@@ -6360,6 +6811,19 @@ def main():
     _session_start_time = time.time()
     _session_start_msgs = len(session.messages)
     _typeahead_text = ""   # type-ahead buffer from previous agent run
+
+    # Scroll region: activate for the entire interactive session
+    global _active_scroll_region
+    _scroll_mode = tui.scroll_region.supported()
+    if _scroll_mode:
+        _active_scroll_region = tui.scroll_region
+        # Store status BEFORE setup() so footer includes it in initial draw
+        pct = min(int((session.get_token_estimate() / config.context_window) * 100), 100)
+        tui.scroll_region.update_status(
+            f"\033[38;5;51m✦ Ready\033[0m \033[38;5;240m│ ctx:{pct}% │ {config.model}\033[0m"
+        )
+        tui.scroll_region.update_hint("")
+        tui.scroll_region.setup()
 
     while True:
         try:
@@ -6874,14 +7338,18 @@ def main():
                     print(f"  Debug mode: {state_str}")
                     continue
 
+                elif cmd == "/debug-scroll":
+                    _debug_scroll_region(tui)
+                    continue
+
                 else:
                     # "Did you mean?" for typo'd slash commands
                     _all_cmds = ["/help", "/exit", "/quit", "/clear", "/model", "/models",
                                  "/status", "/save", "/compact", "/yes", "/no",
                                  "/tokens", "/commit", "/diff", "/git", "/plan",
                                  "/approve", "/act", "/execute", "/undo", "/init",
-                                 "/config", "/debug", "/checkpoint", "/rollback",
-                                 "/autotest", "/skills"]
+                                 "/config", "/debug", "/debug-scroll", "/checkpoint",
+                                 "/rollback", "/autotest", "/skills"]
                     _close = [c for c in _all_cmds if c.startswith(cmd[:3])] if len(cmd) >= 3 else []
                     if not _close:
                         _close = [c for c in _all_cmds if cmd[1:] in c] if len(cmd) > 1 else []
@@ -6896,14 +7364,24 @@ def main():
             # Capture type-ahead for next prompt (text typed during execution)
             _typeahead_text = agent.get_typeahead()
             if _typeahead_text:
-                print(f"  {_ansi(chr(27)+'[38;5;240m')}(type-ahead: \"{_typeahead_text}\"){C.RESET}")
+                tui._scroll_print(f"  {_ansi(chr(27)+'[38;5;240m')}(type-ahead: \"{_typeahead_text}\"){C.RESET}")
             # Auto-save after each interaction (user's work is never lost)
             session.save()
+            # Update scroll region status back to "Ready"
+            if _scroll_mode and tui.scroll_region._active:
+                pct = min(int((session.get_token_estimate() / config.context_window) * 100), 100)
+                tui.scroll_region.update_status(
+                    f"\033[38;5;51m✦ Ready\033[0m \033[38;5;240m│ ctx:{pct}% │ {config.model}\033[0m"
+                )
+                tui.scroll_region.update_hint("")
 
         except KeyboardInterrupt:
             now = time.time()
             if now - _last_ctrl_c[0] < 1.5:
                 # Double Ctrl+C within 1.5s → exit
+                if _scroll_mode and tui.scroll_region._active:
+                    tui.scroll_region.teardown()
+                    _active_scroll_region = None
                 session.save()
                 _elapsed = int(time.time() - _session_start_time)
                 _mins, _secs = divmod(_elapsed, 60)
@@ -6911,11 +7389,22 @@ def main():
                 print(f"\n  {_ansi(chr(27)+'[38;5;51m')}✦ Session saved ({_dur}). Goodbye! ✦{C.RESET}")
                 break
             _last_ctrl_c[0] = now
-            print(f"\n{C.DIM}(Ctrl+C again within 1.5s to exit, or type /exit){C.RESET}")
+            tui._scroll_print(f"\n{C.DIM}(Ctrl+C again within 1.5s to exit, or type /exit){C.RESET}")
+            # Restore "Ready" status after interrupt
+            if _scroll_mode and tui.scroll_region._active:
+                pct = min(int((session.get_token_estimate() / config.context_window) * 100), 100)
+                tui.scroll_region.update_status(
+                    f"\033[38;5;51m✦ Ready\033[0m \033[38;5;240m│ ctx:{pct}% │ {config.model}\033[0m"
+                )
+                tui.scroll_region.update_hint("")
             continue
         except EOFError:
             break
 
+    # Teardown scroll region before exit
+    if _scroll_mode and tui.scroll_region._active:
+        tui.scroll_region.teardown()
+        _active_scroll_region = None
     # Save on exit
     session.save()
     # Save readline history on exit (moved from per-input to exit-only)
