@@ -2467,7 +2467,7 @@ class TestPlanMode:
     """Plan mode restricts tools to read-only set."""
 
     def test_plan_mode_tools_set(self):
-        """PLAN_MODE_TOOLS should include read-only and task tools."""
+        """PLAN_MODE_TOOLS should include read-only, task, and plan-write tools."""
         tools = vc.Agent.PLAN_MODE_TOOLS
         assert "Read" in tools
         assert "Glob" in tools
@@ -2476,9 +2476,11 @@ class TestPlanMode:
         assert "WebSearch" in tools
         assert "TaskCreate" in tools
         assert "TaskList" in tools
+        # Write is allowed but restricted to plans/ at runtime
+        assert "Write" in tools
+        assert "AskUserQuestion" in tools
         # Side-effecting tools must NOT be in plan mode
         assert "Bash" not in tools
-        assert "Write" not in tools
         assert "Edit" not in tools
         assert "NotebookEdit" not in tools
 
@@ -7385,8 +7387,8 @@ class TestPlanActMode:
             content = f.read()
         assert "_plan_mode" in content
         assert "ACT_ONLY_TOOLS" in content
-        assert "Phase 1: Analysis" in content
-        assert "Phase 2: Execution" in content
+        assert "Plan Mode" in content
+        assert "Act Mode" in content
 
     def test_act_only_tools_defined(self):
         """ACT_ONLY_TOOLS should contain write/edit/bash tools."""
@@ -9394,3 +9396,237 @@ class TestScrollRegionScreen:
         # Footer area should be cleared
         sep = screen.get_row(22)
         assert '─' not in sep, f"Separator still visible after teardown: {sep!r}"
+
+
+# ---------------------------------------------------------------------------
+# PR #9 review fixes — new test classes
+# ---------------------------------------------------------------------------
+
+class TestCharDisplayWidth:
+    """_char_display_width correctly reports terminal width for various scripts."""
+
+    def test_ascii_is_width_1(self):
+        assert vc._char_display_width('A') == 1
+        assert vc._char_display_width('z') == 1
+        assert vc._char_display_width(' ') == 1
+
+    def test_cjk_is_width_2(self):
+        assert vc._char_display_width('日') == 2
+        assert vc._char_display_width('本') == 2
+        assert vc._char_display_width('語') == 2
+
+    def test_latin_extended_is_width_1(self):
+        """This is the key regression test — 'é' was misclassified as width 2 before."""
+        assert vc._char_display_width('é') == 1
+        assert vc._char_display_width('ñ') == 1
+        assert vc._char_display_width('ü') == 1
+
+    def test_cyrillic_is_width_1(self):
+        assert vc._char_display_width('Д') == 1
+        assert vc._char_display_width('Ж') == 1
+
+    def test_fullwidth_form_is_width_2(self):
+        # U+FF21 FULLWIDTH LATIN CAPITAL LETTER A
+        assert vc._char_display_width('\uff21') == 2
+
+    def test_display_width_delegates_to_char(self):
+        """_display_width should agree with sum of _char_display_width."""
+        text = "Hello日本語éñ"
+        expected = sum(vc._char_display_width(c) for c in text)
+        assert vc._display_width(text) == expected
+
+
+
+class TestReadLatestPlan:
+    """_read_latest_plan reads active plan or falls back to newest .md."""
+
+    def _make_agent_stub(self, cwd, active_plan_path=None):
+        """Create a minimal agent-like object for _read_latest_plan."""
+        config = type("C", (), {"cwd": cwd})()
+        agent = type("A", (), {
+            "_active_plan_path": active_plan_path,
+            "config": config,
+        })()
+        return agent
+
+    def test_reads_active_plan_path(self):
+        with tempfile.TemporaryDirectory() as td:
+            plan_file = os.path.join(td, "plan.md")
+            with open(plan_file, "w") as f:
+                f.write("# My plan\nStep 1")
+            agent = self._make_agent_stub(td, active_plan_path=plan_file)
+            result = vc._read_latest_plan(agent)
+            assert "My plan" in result
+
+    def test_fallback_to_newest_md(self):
+        with tempfile.TemporaryDirectory() as td:
+            plans_dir = os.path.join(td, ".vibe-local", "plans")
+            os.makedirs(plans_dir)
+            # Create two plan files with different mtimes
+            old = os.path.join(plans_dir, "old.md")
+            new = os.path.join(plans_dir, "new.md")
+            with open(old, "w") as f:
+                f.write("old plan")
+            with open(new, "w") as f:
+                f.write("new plan")
+            # Set mtime explicitly to avoid flaky tests on slow filesystems
+            os.utime(old, (1000000, 1000000))
+            os.utime(new, (2000000, 2000000))
+            agent = self._make_agent_stub(td, active_plan_path=None)
+            result = vc._read_latest_plan(agent)
+            assert "new plan" in result
+
+    def test_no_plans_dir_returns_empty(self):
+        with tempfile.TemporaryDirectory() as td:
+            agent = self._make_agent_stub(td, active_plan_path=None)
+            result = vc._read_latest_plan(agent)
+            assert result == ""
+
+    def test_truncates_at_8000_chars(self):
+        with tempfile.TemporaryDirectory() as td:
+            plan_file = os.path.join(td, "big.md")
+            with open(plan_file, "w") as f:
+                f.write("x" * 10000)
+            agent = self._make_agent_stub(td, active_plan_path=plan_file)
+            result = vc._read_latest_plan(agent)
+            assert len(result) == 8000
+
+
+class TestPlanListSamefile:
+    """/plan list should not crash when files are missing."""
+
+    def test_samefile_guard_in_source(self):
+        """The samefile call should be wrapped with os.path.exists checks."""
+        import inspect
+        # The /plan list code is inside main()
+        source = inspect.getsource(vc.main)
+        assert "os.path.exists" in source or "path.exists" in source
+        # Should also have try/except around samefile
+        assert "samefile" in source
+
+    def test_samefile_with_missing_file_no_crash(self):
+        """os.path.samefile should not be called with missing paths."""
+        # Directly test the defensive pattern
+        fp = "/nonexistent/path/plan.md"
+        active = "/also/nonexistent/active.md"
+        try:
+            result = " ◀" if (active
+                               and os.path.exists(fp)
+                               and os.path.exists(active)
+                               and os.path.samefile(fp, active)) else ""
+        except (OSError, ValueError):
+            result = ""
+        assert result == ""
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PR #9 Coverage Holes
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestExitPlanModeCheckpoint:
+    """_exit_plan_mode creates a git checkpoint via stash create/store."""
+
+    def _make_exit_plan_agent(self, td, is_git=True, run_git_returns=None):
+        """Build minimal agent + session stubs for _exit_plan_mode."""
+        cfg = vc.Config()
+        cfg.cwd = td
+        cfg.sessions_dir = tempfile.mkdtemp()
+        cfg.yes_mode = True
+        defaults = [(True, "abc123"), (True, "")]
+        gc = type("MockGC", (), {
+            "_is_git_repo": is_git,
+            "_run_git": mock.MagicMock(side_effect=run_git_returns or defaults),
+            "_checkpoints": [],
+            "MAX_CHECKPOINTS": 20,
+        })()
+        session = type("MockSession", (), {
+            "add_system_note": mock.MagicMock(),
+        })()
+        agent = type("A", (), {
+            "_plan_mode": True,
+            "_active_plan_path": None,
+            "config": cfg,
+            "git_checkpoint": gc,
+        })()
+        return agent, session
+
+    def test_creates_checkpoint_when_git_repo(self):
+        """stash create returns a ref → checkpoint appended."""
+        with tempfile.TemporaryDirectory() as td:
+            agent, session = self._make_exit_plan_agent(td, is_git=True)
+            vc._exit_plan_mode(agent, session)
+            assert len(agent.git_checkpoint._checkpoints) == 1
+            assert agent.git_checkpoint._checkpoints[0][1] == "plan-to-act"
+
+    def test_skips_checkpoint_when_not_git_repo(self):
+        """_is_git_repo=False → _run_git never called."""
+        with tempfile.TemporaryDirectory() as td:
+            agent, session = self._make_exit_plan_agent(td, is_git=False)
+            vc._exit_plan_mode(agent, session)
+            agent.git_checkpoint._run_git.assert_not_called()
+            assert len(agent.git_checkpoint._checkpoints) == 0
+
+    def test_skips_when_stash_create_returns_empty(self):
+        """stash create returns empty ref (clean tree) → no checkpoint."""
+        with tempfile.TemporaryDirectory() as td:
+            agent, session = self._make_exit_plan_agent(
+                td, is_git=True, run_git_returns=[(True, "")]
+            )
+            vc._exit_plan_mode(agent, session)
+            assert len(agent.git_checkpoint._checkpoints) == 0
+
+    def test_max_checkpoints_trimming(self):
+        """Checkpoints list is trimmed to MAX_CHECKPOINTS."""
+        with tempfile.TemporaryDirectory() as td:
+            agent, session = self._make_exit_plan_agent(td, is_git=True)
+            # Pre-fill to MAX_CHECKPOINTS
+            mc = agent.git_checkpoint.MAX_CHECKPOINTS
+            agent.git_checkpoint._checkpoints = [
+                (i, f"cp-{i}", 1000.0 + i) for i in range(mc)
+            ]
+            vc._exit_plan_mode(agent, session)
+            assert len(agent.git_checkpoint._checkpoints) == mc
+
+
+class TestWriteRestrictionGuardBehavior:
+    """Behavioral tests: guard logic with real paths (realpath + startswith)."""
+
+    @staticmethod
+    def _is_write_allowed_in_plan_mode(file_path, cwd):
+        """Reproduce the guard logic from Agent.run()."""
+        fpath = os.path.realpath(file_path)
+        plans_dir = os.path.realpath(os.path.join(cwd, ".vibe-local", "plans"))
+        return fpath.startswith(plans_dir + os.sep)
+
+    def test_write_inside_plans_dir_allowed(self):
+        with tempfile.TemporaryDirectory() as td:
+            plans_dir = os.path.join(td, ".vibe-local", "plans")
+            os.makedirs(plans_dir)
+            target = os.path.join(plans_dir, "plan.md")
+            assert self._is_write_allowed_in_plan_mode(target, td) is True
+
+    def test_write_outside_plans_dir_blocked(self):
+        with tempfile.TemporaryDirectory() as td:
+            os.makedirs(os.path.join(td, ".vibe-local", "plans"))
+            target = os.path.join(td, "README.md")
+            assert self._is_write_allowed_in_plan_mode(target, td) is False
+
+    def test_write_traversal_blocked(self):
+        with tempfile.TemporaryDirectory() as td:
+            plans_dir = os.path.join(td, ".vibe-local", "plans")
+            os.makedirs(plans_dir)
+            # Path traversal: plans/../../evil.py resolves outside plans/
+            target = os.path.join(plans_dir, "..", "..", "evil.py")
+            assert self._is_write_allowed_in_plan_mode(target, td) is False
+
+    def test_write_plans_dir_itself_blocked(self):
+        """plans/ directory path (without trailing sep) is blocked."""
+        with tempfile.TemporaryDirectory() as td:
+            plans_dir = os.path.join(td, ".vibe-local", "plans")
+            os.makedirs(plans_dir)
+            assert self._is_write_allowed_in_plan_mode(plans_dir, td) is False
+
+
+

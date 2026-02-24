@@ -173,13 +173,14 @@ def _get_terminal_width():
         return 80
 
 
+def _char_display_width(ch):
+    """Return terminal display width of a single character (1 or 2)."""
+    return 2 if unicodedata.east_asian_width(ch) in ('W', 'F') else 1
+
+
 def _display_width(text):
     """Calculate terminal display width accounting for CJK double-width characters."""
-    w = 0
-    for ch in text:
-        eaw = unicodedata.east_asian_width(ch)
-        w += 2 if eaw in ('W', 'F') else 1
-    return w
+    return sum(_char_display_width(ch) for ch in text)
 
 
 def _truncate_to_display_width(text, max_width):
@@ -236,8 +237,7 @@ class ScrollRegion:
         if self._debug_log is None:
             return
         try:
-            import time as _t
-            ts = _t.strftime("%H:%M:%S")
+            ts = time.strftime("%H:%M:%S")
             # Show escape sequences as readable text
             readable = buf.replace("\033", "ESC")
             self._debug_log.write(f"[{ts}] {label}: {readable!r}\n")
@@ -330,8 +330,12 @@ class ScrollRegion:
             buf += f"\033[{self._rows};1H"               # Move cursor to bottom
             self._log("teardown", buf)
             self._atomic_write(buf)
-            # Preserve status/hint text — they'll be restored on next setup()
-            # and overwritten by update_status() when needed
+            if self._debug_log is not None:
+                try:
+                    self._debug_log.close()
+                except Exception:
+                    pass
+                self._debug_log = None
 
     def resize(self):
         """Handle terminal resize (SIGWINCH).
@@ -553,6 +557,7 @@ class InputMonitor:
 
     def __init__(self, on_typeahead=None):
         self._pressed = threading.Event()
+
         self._stop_event = threading.Event()
         self._thread = None
         self._old_settings = None
@@ -564,6 +569,7 @@ class InputMonitor:
     def pressed(self):
         """True if ESC was pressed since start()."""
         return self._pressed.is_set()
+
 
     def get_typeahead(self):
         """Return and clear any buffered type-ahead text (decoded as utf-8)."""
@@ -611,6 +617,22 @@ class InputMonitor:
                 except OSError:
                     break
                 if ch == b'\x1b':
+                    # Could be Shift+Tab (\x1b[Z) or plain ESC
+                    # Peek ahead for '[' within a short timeout
+                    try:
+                        r2, _, _ = _select_mod.select([fd], [], [], 0.05)
+                    except (OSError, ValueError):
+                        r2 = []
+                    if r2:
+                        ch2 = os.read(fd, 1)
+                        if ch2 == b'[':
+                            try:
+                                r3, _, _ = _select_mod.select([fd], [], [], 0.05)
+                            except (OSError, ValueError):
+                                r3 = []
+                            if r3:
+                                os.read(fd, 1)  # consume sequence byte
+                            # Any ESC sequence → treat as interrupt
                     self._pressed.set()
                     break
                 elif ch == b'\x03':  # Ctrl+C
@@ -3440,9 +3462,6 @@ class AskUserQuestionTool(Tool):
         if not question:
             return "Error: question is required"
 
-        # Keep DECSTBM active — input works within the scroll region
-        _sr = _active_scroll_region
-
         with _print_lock:
             print(f"\n{_ansi(C.CYAN)}{_ansi(C.BOLD)}Question:{_ansi(C.RESET)} {question}")
             if options:
@@ -5186,6 +5205,7 @@ class TUI:
     # ANSI escape regex for stripping colors from tool output
     _ANSI_RE = re.compile(r'\033\[[0-9;]*[a-zA-Z]')
 
+
     def __init__(self, config):
         self.config = config
         self._spinner_stop = threading.Event()  # C3: thread-safe Event
@@ -5193,6 +5213,7 @@ class TUI:
         self.is_interactive = sys.stdin.isatty() and sys.stdout.isatty()
         self._is_cjk = self._detect_cjk_locale()
         self.scroll_region = ScrollRegion()
+
         try:
             self._term_cols = shutil.get_terminal_size((80, 24)).columns
         except (ValueError, OSError):
@@ -5355,33 +5376,43 @@ class TUI:
         cjk_prefixes = ("ja", "zh", "ko", "ja_JP", "zh_CN", "zh_TW", "ko_KR")
         return any(lang.startswith(p) for p in cjk_prefixes)
 
-    def show_input_separator(self):
+
+    def show_input_separator(self, plan_mode=False):
         """Print a subtle separator line before the input prompt.
         Visually delineates the input area from agent output above."""
         if not self.is_interactive:
             return
         # Thin separator: dim dotted line, adapts to terminal width
         sep_w = min(60, _get_terminal_width() - 4)
-        print(f"{C.DIM}{'·' * sep_w}{C.RESET}")
+        if plan_mode:
+            _c226 = _ansi(chr(27) + '[38;5;226m')
+            _c240 = _ansi("\033[38;5;240m")
+            lbl = f" PLAN MODE "
+            pad = max(0, sep_w - len(lbl) - 4)
+            left = pad // 2
+            right = pad - left
+            print(f"{_c226}{'─' * left}{lbl}{'─' * right}  {_c240}/approve: Act mode{C.RESET}")
+        else:
+            print(f"{C.DIM}{'·' * sep_w}{C.RESET}")
 
     def get_input(self, session=None, plan_mode=False, prefill=""):
-        """Get user input with readline support. Returns None on EOF/exit.
-        IME-safe: in CJK locales, waits for a brief pause after Enter
-        to avoid sending during kanji conversion.
-        prefill: pre-populate the input line (type-ahead from agent execution).
+        """Get user input with full readline support.
+
+        Always uses standard input() for readline features (history, cursor
+        movement, Ctrl+A/E, tab completion). Mode switching is done via
+        /plan and /approve commands.
         """
+
+        # Fallback: standard input() with readline
         try:
-            # Inject type-ahead text via readline startup hook
             if prefill and HAS_READLINE:
                 def _hook():
                     readline.insert_text(prefill)
                     readline.redisplay()
                 readline.set_startup_hook(_hook)
 
-            # Plan mode indicator — use _rl_ansi for readline-safe ANSI in prompts
             _rl_reset = _rl_ansi(C.RESET if C._enabled else "")
             plan_tag = f"{_rl_ansi(chr(27)+'[38;5;226m')}[PLAN]{_rl_reset} " if plan_mode else ""
-            # Show context usage indicator in prompt
             if session:
                 pct = min(int((session.get_token_estimate() / session.config.context_window) * 100), 100)
                 if pct < 50:
@@ -5399,7 +5430,6 @@ class TUI:
             print()
             return None
         finally:
-            # Always clear the startup hook after use
             if HAS_READLINE:
                 readline.set_startup_hook()
 
@@ -5411,10 +5441,7 @@ class TUI:
         - Single Enter to submit in non-CJK mode
         prefill: pre-populate the input line with type-ahead text.
         """
-        # Keep DECSTBM active during input — footer stays visible.
-        # Input/readline works within the scroll region (rows 1..scroll_end).
-        _sr = self.scroll_region
-        _sr_was_active = _sr._active
+        self.show_input_separator(plan_mode=plan_mode)
 
         try:
             first_line = self.get_input(session=session, plan_mode=plan_mode, prefill=prefill)
@@ -6025,8 +6052,9 @@ class TUI:
   {_c198}/diff{C.RESET}              Show git diff
   {_c198}/git{C.RESET} <args>        Run git commands
   {_c51}━━ Plan/Act Mode {sep[16:]}{C.RESET}
-  {_c198}/plan{C.RESET}              Enter plan mode (read-only)
-  {_c198}/approve{C.RESET}, {_c198}/act{C.RESET}     Switch to act mode (execute plan)
+  {_c198}/plan{C.RESET}              Enter plan mode (explore + write plan)
+  {_c198}/plan list{C.RESET}         List recent plan files
+  {_c198}/approve{C.RESET}, {_c198}/act{C.RESET}     Exit plan → act mode (inject plan)
   {_c198}/checkpoint{C.RESET}        Save git checkpoint
   {_c198}/rollback{C.RESET}          Rollback to last checkpoint
   {_c51}━━ Extensions {sep[13:]}{C.RESET}
@@ -6094,6 +6122,8 @@ class Agent:
     # Tools allowed in plan mode (read-only exploration + task tracking)
     PLAN_MODE_TOOLS = {
         "Read", "Glob", "Grep", "WebFetch", "WebSearch",
+        "Write",              # restricted to .vibe-local/plans/ only (runtime guard)
+        "AskUserQuestion",    # clarify requirements during planning
         "TaskCreate", "TaskList", "TaskGet", "TaskUpdate",
         "SubAgent",
     }
@@ -6111,6 +6141,8 @@ class Agent:
         self._interrupted = threading.Event()
         self._tui_lock = threading.Lock()
         self._plan_mode = False
+        self._active_plan_path = None     # current plan file path
+
         self.git_checkpoint = GitCheckpoint(config.cwd)
         self.auto_test = AutoTestRunner(config.cwd)
         self.file_watcher = FileWatcher(config.cwd)
@@ -6353,6 +6385,24 @@ class Agent:
                     tool_name = tool.name
                     # Show what we're about to do FIRST
                     self.tui.show_tool_call(tool_name, tool_params)
+                    # Plan mode: restrict Write to .vibe-local/plans/ only
+                    if self._plan_mode and tool_name == "Write":
+                        try:
+                            fpath = os.path.realpath(tool_params.get("file_path", ""))
+                            plans_dir = os.path.realpath(os.path.join(self.config.cwd, ".vibe-local", "plans"))
+                            if not fpath.startswith(plans_dir + os.sep):
+                                results.append(ToolResult(
+                                    tc_id,
+                                    "Error: In plan mode, Write is restricted to .vibe-local/plans/ directory only. "
+                                    "Use /approve to switch to Act mode for unrestricted writes.",
+                                    True
+                                ))
+                                self.tui.show_tool_result(tool_name, "Blocked: outside plans/ dir", True)
+                                continue
+                        except Exception:
+                            results.append(ToolResult(tc_id, "Error: could not validate file path in plan mode.", True))
+                            self.tui.show_tool_result(tool_name, "Blocked: path validation error", True)
+                            continue
                     # Then ask permission
                     if not self.permissions.check(tool_name, tool_params, self.tui):
                         results.append(ToolResult(tc_id, "Permission denied by user. Do not retry this operation.", True))
@@ -6433,6 +6483,16 @@ class Agent:
                             self.tui.show_tool_result(tool_name, output, is_error=_is_err,
                                                       duration=_tool_dur, params=tool_params)
                             results.append(ToolResult(tc_id, output, _is_err))
+
+                            # Detect plan file creation
+                            if tool_name == "Write" and self._plan_mode and not _is_err:
+                                fpath = tool_params.get("file_path", "")
+                                try:
+                                    real_plans = os.path.realpath(os.path.join(self.config.cwd, ".vibe-local", "plans"))
+                                    if fpath and os.path.realpath(fpath).startswith(real_plans + os.sep):
+                                        self._active_plan_path = fpath
+                                except Exception:
+                                    pass
 
                             # Refresh file watcher snapshot after writes
                             if tool_name in ("Write", "Edit") and self.file_watcher.enabled:
@@ -6582,6 +6642,100 @@ def _show_model_list(models):
             print(f"    {_c}[{tier}]{C.RESET} {m}  {C.DIM}(ctx: {ctx}, ~{min_ram}GB+ RAM){C.RESET}")
         else:
             print(f"    {C.DIM}[?]{C.RESET} {m}")
+
+
+def _enter_plan_mode(agent, session):
+    """Switch agent to Plan mode with plan file setup and LLM guidance."""
+    if agent._plan_mode:
+        print(f"{C.YELLOW}Already in plan mode.{C.RESET}")
+        return
+    agent._plan_mode = True
+    # Ensure plans directory exists
+    plans_dir = os.path.join(agent.config.cwd, ".vibe-local", "plans")
+    os.makedirs(plans_dir, exist_ok=True)
+    # Pre-set plan path with timestamp
+    plan_name = time.strftime("plan-%Y%m%d-%H%M%S.md")
+    agent._active_plan_path = os.path.join(plans_dir, plan_name)
+    # Inject system note to guide LLM
+    session.add_system_note(
+        "[Plan Mode] You are now in Plan mode. Your task is to explore the codebase, "
+        "analyze the problem, and write a plan. Use Read, Glob, Grep, WebFetch, WebSearch "
+        "for exploration. Write your plan to the file: " + agent._active_plan_path + "\n"
+        "When your plan is complete, the user will use /approve to switch to Act mode."
+    )
+    # Banner
+    _c226 = _ansi(chr(27) + '[38;5;226m')
+    _c240 = _ansi(chr(27) + '[38;5;240m')
+    _scroll_aware_print(f"\n  {_c226}━━ Plan Mode ━━━━━━━━━━━━━━━━━━━━━━{C.RESET}")
+    _scroll_aware_print(f"  {_c226}Read-only exploration + plan writing.{C.RESET}")
+    _scroll_aware_print(f"  {_c240}Write restricted to: .vibe-local/plans/{C.RESET}")
+    _scroll_aware_print(f"  {_c240}Plan file: {plan_name}{C.RESET}")
+    _scroll_aware_print(f"  {_c240}/approve → Act mode{C.RESET}")
+    _scroll_aware_print(f"  {_c226}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.RESET}\n")
+
+
+def _read_latest_plan(agent):
+    """Read the active plan file content (max 8000 chars). Falls back to newest .md in plans/."""
+    plan_path = agent._active_plan_path
+    if plan_path and os.path.isfile(plan_path):
+        try:
+            with open(plan_path, "r", encoding="utf-8") as f:
+                return f.read()[:8000]
+        except Exception:
+            pass
+    # Fallback: find newest .md in plans/
+    plans_dir = os.path.join(agent.config.cwd, ".vibe-local", "plans")
+    if os.path.isdir(plans_dir):
+        md_files = sorted(
+            [os.path.join(plans_dir, f) for f in os.listdir(plans_dir) if f.endswith(".md")],
+            key=lambda p: os.path.getmtime(p) if os.path.isfile(p) else 0,
+            reverse=True,
+        )
+        if md_files:
+            try:
+                with open(md_files[0], "r", encoding="utf-8") as f:
+                    return f.read()[:8000]
+            except Exception:
+                pass
+    return ""
+
+
+def _exit_plan_mode(agent, session):
+    """Switch agent from Plan mode to Act mode, injecting the plan into context."""
+    if not agent._plan_mode:
+        print(f"{C.YELLOW}Not in plan mode.{C.RESET}")
+        return
+    plan_content = _read_latest_plan(agent)
+    agent._plan_mode = False
+    # Non-invasive checkpoint: create stash ref without modifying working tree
+    if agent.git_checkpoint._is_git_repo:
+        ok, ref = agent.git_checkpoint._run_git(["stash", "create"])
+        if ok and ref.strip():
+            agent.git_checkpoint._run_git(
+                ["stash", "store", "-m", "vibe-checkpoint: plan-to-act", ref.strip()]
+            )
+            agent.git_checkpoint._checkpoints.append(
+                (len(agent.git_checkpoint._checkpoints), "plan-to-act", time.time())
+            )
+            if len(agent.git_checkpoint._checkpoints) > agent.git_checkpoint.MAX_CHECKPOINTS:
+                agent.git_checkpoint._checkpoints = agent.git_checkpoint._checkpoints[-agent.git_checkpoint.MAX_CHECKPOINTS:]
+    # Inject plan into session context
+    if plan_content:
+        session.add_system_note(
+            "[Act Mode] The following plan was created in Plan mode. Implement it step by step.\n\n"
+            + plan_content
+        )
+    # Banner
+    _c46 = _ansi(chr(27) + '[38;5;46m')
+    _c240 = _ansi(chr(27) + '[38;5;240m')
+    plan_name = os.path.basename(agent._active_plan_path) if agent._active_plan_path else "(none)"
+    _scroll_aware_print(f"\n  {_c46}━━ Act Mode ━━━━━━━━━━━━━━━━━━━━━━━{C.RESET}")
+    _scroll_aware_print(f"  {_c46}All tools re-enabled. Implementing plan.{C.RESET}")
+    if plan_content:
+        _scroll_aware_print(f"  {_c240}Plan loaded: {plan_name} ({len(plan_content)} chars){C.RESET}")
+    _scroll_aware_print(f"  {_c240}/plan → return to Plan mode{C.RESET}")
+    _scroll_aware_print(f"  {_c240}/rollback → undo all changes since plan{C.RESET}")
+    _scroll_aware_print(f"  {_c46}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.RESET}\n")
 
 
 def main():
@@ -7181,31 +7335,51 @@ def main():
 
                 # ── Plan mode commands ────────────────────────────────
                 elif cmd == "/plan":
-                    agent._plan_mode = True
-                    _c226 = _ansi(chr(27)+'[38;5;226m')
-                    _c240 = _ansi(chr(27)+'[38;5;240m')
-                    print(f"\n  {_c226}━━ Plan Mode (Phase 1: Analysis) ━━{C.RESET}")
-                    print(f"  {_c226}Read-only exploration enabled.{C.RESET}")
-                    print(f"  {_c240}Allowed: Read, Glob, Grep, WebFetch, WebSearch, Task*, SubAgent{C.RESET}")
-                    print(f"  {_c240}Blocked: Write, Edit, Bash, NotebookEdit{C.RESET}")
-                    print(f"  {_c240}/approve or /execute → switch to Act mode (Phase 2){C.RESET}")
-                    print(f"  {_c226}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.RESET}\n")
+                    parts = user_input.split(maxsplit=1)
+                    subcmd = parts[1].strip().lower() if len(parts) > 1 else ""
+                    if subcmd == "list":
+                        # List recent plan files
+                        plans_dir = os.path.join(config.cwd, ".vibe-local", "plans")
+                        if not os.path.isdir(plans_dir):
+                            print(f"{C.DIM}  No plans yet.{C.RESET}")
+                        else:
+                            md_files = sorted(
+                                [f for f in os.listdir(plans_dir) if f.endswith(".md")],
+                                key=lambda f: os.path.getmtime(os.path.join(plans_dir, f))
+                                    if os.path.isfile(os.path.join(plans_dir, f)) else 0,
+                                reverse=True,
+                            )[:10]
+                            if not md_files:
+                                print(f"{C.DIM}  No plans yet.{C.RESET}")
+                            else:
+                                _c226 = _ansi(chr(27) + '[38;5;226m')
+                                _c240 = _ansi(chr(27) + '[38;5;240m')
+                                print(f"\n  {_c226}━━ Plans (newest first) ━━{C.RESET}")
+                                for pf in md_files:
+                                    fp = os.path.join(plans_dir, pf)
+                                    try:
+                                        sz = os.path.getsize(fp)
+                                    except OSError:
+                                        sz = 0
+                                    sz_str = f"{sz:,}B" if sz < 1024 else f"{sz/1024:.1f}KB"
+                                    try:
+                                        active = " ◀" if (agent._active_plan_path
+                                                           and os.path.exists(fp)
+                                                           and os.path.exists(agent._active_plan_path)
+                                                           and os.path.samefile(fp, agent._active_plan_path)) else ""
+                                    except (OSError, ValueError):
+                                        active = ""
+                                    print(f"  {_c240}{pf}  ({sz_str}){active}{C.RESET}")
+                                print()
+                    else:
+                        _enter_plan_mode(agent, session)
                     continue
 
                 elif cmd in ("/execute", "/plan-execute", "/approve", "/act"):
                     if not agent._plan_mode:
                         print(f"{C.YELLOW}Not in plan mode. Use /plan first.{C.RESET}")
                     else:
-                        agent._plan_mode = False
-                        # Auto-checkpoint before entering Act mode
-                        if agent.git_checkpoint._is_git_repo:
-                            if agent.git_checkpoint.create("plan-to-act"):
-                                print(f"  {_ansi(chr(27)+'[38;5;87m')}Git checkpoint saved (use /rollback to undo){C.RESET}")
-                        print(f"\n  {_ansi(chr(27)+'[38;5;46m')}━━ Act Mode (Phase 2: Execution) ━━{C.RESET}")
-                        print(f"  {_ansi(chr(27)+'[38;5;46m')}All tools re-enabled. Implementing plan.{C.RESET}")
-                        print(f"  {_ansi(chr(27)+'[38;5;240m')}/plan → return to read-only mode{C.RESET}")
-                        print(f"  {_ansi(chr(27)+'[38;5;240m')}/rollback → undo all changes since plan{C.RESET}")
-                        print(f"  {_ansi(chr(27)+'[38;5;46m')}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.RESET}\n")
+                        _exit_plan_mode(agent, session)
                     continue
 
                 # ── Git checkpoint & rollback ────────────────────────
