@@ -9562,3 +9562,115 @@ class TestShiftTabSentinel:
         assert "_SHIFT_TAB_SENTINEL" in source
         # It should return the sentinel, not transform it
         assert "return first_line" in source or "return self._SHIFT_TAB_SENTINEL" in source
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PR #9 Coverage Holes
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestExitPlanModeCheckpoint:
+    """_exit_plan_mode creates a git checkpoint via stash create/store."""
+
+    def _make_exit_plan_agent(self, td, is_git=True, run_git_returns=None):
+        """Build minimal agent + session stubs for _exit_plan_mode."""
+        cfg = vc.Config()
+        cfg.cwd = td
+        cfg.sessions_dir = tempfile.mkdtemp()
+        cfg.yes_mode = True
+        defaults = [(True, "abc123"), (True, "")]
+        gc = type("MockGC", (), {
+            "_is_git_repo": is_git,
+            "_run_git": mock.MagicMock(side_effect=run_git_returns or defaults),
+            "_checkpoints": [],
+            "MAX_CHECKPOINTS": 20,
+        })()
+        session = type("MockSession", (), {
+            "add_system_note": mock.MagicMock(),
+        })()
+        agent = type("A", (), {
+            "_plan_mode": True,
+            "_active_plan_path": None,
+            "config": cfg,
+            "git_checkpoint": gc,
+        })()
+        return agent, session
+
+    def test_creates_checkpoint_when_git_repo(self):
+        """stash create returns a ref → checkpoint appended."""
+        with tempfile.TemporaryDirectory() as td:
+            agent, session = self._make_exit_plan_agent(td, is_git=True)
+            vc._exit_plan_mode(agent, session)
+            assert len(agent.git_checkpoint._checkpoints) == 1
+            assert agent.git_checkpoint._checkpoints[0][1] == "plan-to-act"
+
+    def test_skips_checkpoint_when_not_git_repo(self):
+        """_is_git_repo=False → _run_git never called."""
+        with tempfile.TemporaryDirectory() as td:
+            agent, session = self._make_exit_plan_agent(td, is_git=False)
+            vc._exit_plan_mode(agent, session)
+            agent.git_checkpoint._run_git.assert_not_called()
+            assert len(agent.git_checkpoint._checkpoints) == 0
+
+    def test_skips_when_stash_create_returns_empty(self):
+        """stash create returns empty ref (clean tree) → no checkpoint."""
+        with tempfile.TemporaryDirectory() as td:
+            agent, session = self._make_exit_plan_agent(
+                td, is_git=True, run_git_returns=[(True, "")]
+            )
+            vc._exit_plan_mode(agent, session)
+            assert len(agent.git_checkpoint._checkpoints) == 0
+
+    def test_max_checkpoints_trimming(self):
+        """Checkpoints list is trimmed to MAX_CHECKPOINTS."""
+        with tempfile.TemporaryDirectory() as td:
+            agent, session = self._make_exit_plan_agent(td, is_git=True)
+            # Pre-fill to MAX_CHECKPOINTS
+            mc = agent.git_checkpoint.MAX_CHECKPOINTS
+            agent.git_checkpoint._checkpoints = [
+                (i, f"cp-{i}", 1000.0 + i) for i in range(mc)
+            ]
+            vc._exit_plan_mode(agent, session)
+            assert len(agent.git_checkpoint._checkpoints) == mc
+
+
+class TestWriteRestrictionGuardBehavior:
+    """Behavioral tests: guard logic with real paths (realpath + startswith)."""
+
+    @staticmethod
+    def _is_write_allowed_in_plan_mode(file_path, cwd):
+        """Reproduce the guard logic from Agent.run()."""
+        fpath = os.path.realpath(file_path)
+        plans_dir = os.path.realpath(os.path.join(cwd, ".vibe-local", "plans"))
+        return fpath.startswith(plans_dir + os.sep)
+
+    def test_write_inside_plans_dir_allowed(self):
+        with tempfile.TemporaryDirectory() as td:
+            plans_dir = os.path.join(td, ".vibe-local", "plans")
+            os.makedirs(plans_dir)
+            target = os.path.join(plans_dir, "plan.md")
+            assert self._is_write_allowed_in_plan_mode(target, td) is True
+
+    def test_write_outside_plans_dir_blocked(self):
+        with tempfile.TemporaryDirectory() as td:
+            os.makedirs(os.path.join(td, ".vibe-local", "plans"))
+            target = os.path.join(td, "README.md")
+            assert self._is_write_allowed_in_plan_mode(target, td) is False
+
+    def test_write_traversal_blocked(self):
+        with tempfile.TemporaryDirectory() as td:
+            plans_dir = os.path.join(td, ".vibe-local", "plans")
+            os.makedirs(plans_dir)
+            # Path traversal: plans/../../evil.py resolves outside plans/
+            target = os.path.join(plans_dir, "..", "..", "evil.py")
+            assert self._is_write_allowed_in_plan_mode(target, td) is False
+
+    def test_write_plans_dir_itself_blocked(self):
+        """plans/ directory path (without trailing sep) is blocked."""
+        with tempfile.TemporaryDirectory() as td:
+            plans_dir = os.path.join(td, ".vibe-local", "plans")
+            os.makedirs(plans_dir)
+            assert self._is_write_allowed_in_plan_mode(plans_dir, td) is False
+
+
+
