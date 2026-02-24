@@ -1949,10 +1949,11 @@ class RAGEngine:
 
         conn = sqlite3.connect(self.db_path)
         try:
-            # Phase 1: path と embedding のみフェッチしてスコアリング（content は不要）
-            # Note: embedding BLOB は全チャンク分をメモリにロードする。大規模インデックス
-            # （数万チャンク超）ではこれ自体がボトルネックになり得るが、完全な解決には
-            # 外部ベクトルDB（sqlite-vec 等）が必要なため、現バージョンの既知の制限とする。
+            # Phase 1: fetch path + embedding only for scoring (no content needed yet)
+            # Note: all embedding BLOBs are loaded into memory at once. For very large
+            # indexes (tens of thousands of chunks) this can become a bottleneck; a
+            # complete fix would require an external vector DB (e.g. sqlite-vec) and is
+            # left as a known limitation of the current implementation.
             rows = conn.execute(
                 "SELECT path, chunk_index, embedding FROM documents"
             ).fetchall()
@@ -1969,7 +1970,7 @@ class RAGEngine:
             scored.sort(key=lambda x: x[0], reverse=True)
             top = scored[:top_k]
 
-            # Phase 2: top-k チャンクの content のみ取得
+            # Phase 2: fetch content only for the top-k winners
             results = []
             for sim, path, chunk_index in top:
                 row = conn.execute(
