@@ -12,14 +12,27 @@
 #   vibe-local -y                    # Skip permission check
 #   vibe-local -DebugMode             # Debug mode
 
-param(
-    [switch]$Auto,
-    [switch]$Yes,
-    [switch]$DebugMode,
-    [string]$Model,
-    [Parameter(ValueFromRemainingArguments)]
-    [string[]]$ExtraArgs
-)
+# Manual parameter parsing to prevent PowerShell common parameter conflicts (e.g., -p vs -ProgressAction)
+$Auto = $false
+$Yes = $false
+$DebugMode = $false
+$Model = ""
+$Prompt = ""
+$ExtraArgs = @()
+
+for ($i = 0; $i -lt $args.Count; $i++) {
+    $arg = $args[$i]
+    if ($arg -match '^(?i)(-Auto|--auto|-a)$') { $Auto = $true }
+    elseif ($arg -match '^(?i)(-y|-Yes|--yes)$') { $Yes = $true }
+    elseif ($arg -match '^(?i)(-DebugMode|--debug|-d)$') { $DebugMode = $true }
+    elseif ($arg -match '^(?i)(-Model|--model|-m)$') { 
+        if ($i + 1 -lt $args.Count) { $Model = $args[$i+1]; $i++ }
+    }
+    elseif ($arg -match '^(?i)(-Prompt|--prompt|-p)$') {
+        if ($i + 1 -lt $args.Count) { $Prompt = $args[$i+1]; $i++ }
+    }
+    else { $ExtraArgs += $arg }
+}
 
 $ErrorActionPreference = "Continue"
 
@@ -284,7 +297,10 @@ try {
     $env:PYTHONIOENCODING = "utf-8"
     $env:PYTHONUTF8 = "1"
 
-    $allArgs = $ModelArgs + $PermArgs + $DebugArgs + $ExtraArgs
+    $PromptArgs = @()
+    if ($Prompt) { $PromptArgs += @("-p", $Prompt) }
+
+    $allArgs = $ModelArgs + $PermArgs + $DebugArgs + $PromptArgs + $ExtraArgs
 
     $pyParts = $PythonCmd -split ' '
     if ($pyParts.Count -eq 2) {
