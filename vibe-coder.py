@@ -173,13 +173,14 @@ def _get_terminal_width():
         return 80
 
 
+def _char_display_width(ch):
+    """Return terminal display width of a single character (1 or 2)."""
+    return 2 if unicodedata.east_asian_width(ch) in ('W', 'F') else 1
+
+
 def _display_width(text):
     """Calculate terminal display width accounting for CJK double-width characters."""
-    w = 0
-    for ch in text:
-        eaw = unicodedata.east_asian_width(ch)
-        w += 2 if eaw in ('W', 'F') else 1
-    return w
+    return sum(_char_display_width(ch) for ch in text)
 
 
 def _truncate_to_display_width(text, max_width):
@@ -5388,9 +5389,11 @@ class TUI:
         return any(lang.startswith(p) for p in cjk_prefixes)
 
     def _build_prompt_str(self, session=None, plan_mode=False):
-        """Build the prompt string for display. Returns (visible_str, raw_str_for_display).
-        In Plan mode: [PLAN] tag (yellow) + ▸ prompt.
-        In Act mode: ❯ prompt (cyan).
+        """Build the prompt string for raw-mode display (not readline).
+
+        Uses _ansi() instead of _rl_ansi() because this string is rendered
+        via sys.stdout.write() in _raw_input_with_shift_tab(), which does not
+        use readline. Readline's \\001/\\002 markers would appear as garbage.
         """
         _c226 = _ansi(chr(27) + '[38;5;226m')
         _c51 = _ansi(chr(27) + '[38;5;51m')
@@ -5474,7 +5477,7 @@ class TUI:
                     if buf:
                         # Determine display width of removed char
                         removed = buf.pop()
-                        w = 2 if ord(removed) > 0x7F else 1  # rough CJK width
+                        w = _char_display_width(removed)
                         sys.stdout.write("\b" * w + " " * w + "\b" * w)
                         sys.stdout.flush()
                     continue
@@ -5483,7 +5486,7 @@ class TUI:
                 if b == 0x15:
                     if buf:
                         # Calculate display width and clear
-                        dw = sum(2 if ord(c) > 0x7F else 1 for c in buf)
+                        dw = sum(_char_display_width(c) for c in buf)
                         sys.stdout.write("\b" * dw + " " * dw + "\b" * dw)
                         sys.stdout.flush()
                         buf.clear()
@@ -5499,7 +5502,7 @@ class TUI:
                             removed_width += 1
                         while buf and buf[-1] != " ":
                             c = buf.pop()
-                            removed_width += 2 if ord(c) > 0x7F else 1
+                            removed_width += _char_display_width(c)
                         sys.stdout.write("\b" * removed_width + " " * removed_width + "\b" * removed_width)
                         sys.stdout.flush()
                     continue
@@ -5536,7 +5539,7 @@ class TUI:
                                             history_idx += 1
                                             item = readline.get_history_item(max_idx - history_idx) or ""
                                             # Clear current line and show history item
-                                            dw = sum(2 if ord(c) > 0x7F else 1 for c in buf)
+                                            dw = sum(_char_display_width(c) for c in buf)
                                             sys.stdout.write("\b" * dw + " " * dw + "\b" * dw)
                                             buf = list(item)
                                             sys.stdout.write(item)
@@ -5552,7 +5555,7 @@ class TUI:
                                             else:
                                                 max_idx = readline.get_current_history_length()
                                                 item = readline.get_history_item(max_idx - history_idx) or ""
-                                            dw = sum(2 if ord(c) > 0x7F else 1 for c in buf)
+                                            dw = sum(_char_display_width(c) for c in buf)
                                             sys.stdout.write("\b" * dw + " " * dw + "\b" * dw)
                                             buf = list(item)
                                             sys.stdout.write(item)
@@ -5618,25 +5621,17 @@ class TUI:
             pad = sep_w - len(lbl) - 4
             left = pad // 2
             right = pad - left
-            print(f"{_c226}{'─' * left}{lbl}{'─' * right}  {_c240}Shift+Tab: Act mode{C.RESET}")
+            print(f"{_c226}{'─' * left}{lbl}{'─' * right}  {_c240}/approve: Act mode{C.RESET}")
         else:
             print(f"{C.DIM}{'·' * sep_w}{C.RESET}")
 
     def get_input(self, session=None, plan_mode=False, prefill=""):
-        """Get user input with Shift+Tab detection.
-        Uses raw input loop on macOS/Linux (termios available) to reliably
-        detect Shift+Tab. Falls back to standard input() otherwise.
-        prefill: pre-populate the input line (type-ahead from agent execution).
-        Returns _SHIFT_TAB_SENTINEL on Shift+Tab, None on EOF/exit.
+        """Get user input with full readline support.
+
+        Always uses standard input() for readline features (history, cursor
+        movement, Ctrl+A/E, tab completion). Mode switching is done via
+        /plan command or Shift+Tab during agent execution (InputMonitor).
         """
-        # Use raw input loop when termios is available and interactive
-        if HAS_TERMIOS and sys.stdin.isatty():
-            prompt_str = self._build_prompt_str(session=session, plan_mode=plan_mode)
-            try:
-                return self._raw_input_with_shift_tab(prompt_str, prefill=prefill)
-            except KeyboardInterrupt:
-                print()
-                return None
 
         # Fallback: standard input() with readline
         try:
@@ -6303,7 +6298,6 @@ class TUI:
   {_c198}/watch{C.RESET}             Toggle file watcher
   {_c198}/skills{C.RESET}            List loaded skills
   {_c51}━━ Keyboard {sep[11:]}{C.RESET}
-  {_c198}Shift+Tab{C.RESET}          Toggle Plan/Act mode
   {_c198}Ctrl+C{C.RESET}             Stop current task
   {_c198}Ctrl+C x2{C.RESET}          Exit (within 1.5s)
   {_c198}Ctrl+D{C.RESET}             Exit
@@ -6916,7 +6910,7 @@ def _enter_plan_mode(agent, session):
     print(f"  {_c226}Read-only exploration + plan writing.{C.RESET}")
     print(f"  {_c240}Write restricted to: .vibe-local/plans/{C.RESET}")
     print(f"  {_c240}Plan file: {plan_name}{C.RESET}")
-    print(f"  {_c240}Shift+Tab or /approve → Act mode{C.RESET}")
+    print(f"  {_c240}/approve → Act mode{C.RESET}")
     print(f"  {_c226}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.RESET}\n")
 
 
@@ -6953,6 +6947,18 @@ def _exit_plan_mode(agent, session):
         return
     plan_content = _read_latest_plan(agent)
     agent._plan_mode = False
+    # Non-invasive checkpoint: create stash ref without modifying working tree
+    if agent.git_checkpoint._is_git_repo:
+        ok, ref = agent.git_checkpoint._run_git(["stash", "create"])
+        if ok and ref.strip():
+            agent.git_checkpoint._run_git(
+                ["stash", "store", "-m", "vibe-checkpoint: plan-to-act", ref.strip()]
+            )
+            agent.git_checkpoint._checkpoints.append(
+                (len(agent.git_checkpoint._checkpoints), "plan-to-act", time.time())
+            )
+            if len(agent.git_checkpoint._checkpoints) > agent.git_checkpoint.MAX_CHECKPOINTS:
+                agent.git_checkpoint._checkpoints = agent.git_checkpoint._checkpoints[-agent.git_checkpoint.MAX_CHECKPOINTS:]
     # Inject plan into session context
     if plan_content:
         session.add_system_note(
@@ -6967,7 +6973,7 @@ def _exit_plan_mode(agent, session):
     print(f"  {_c46}All tools re-enabled. Implementing plan.{C.RESET}")
     if plan_content:
         print(f"  {_c240}Plan loaded: {plan_name} ({len(plan_content)} chars){C.RESET}")
-    print(f"  {_c240}Shift+Tab or /plan → return to Plan mode{C.RESET}")
+    print(f"  {_c240}/plan → return to Plan mode{C.RESET}")
     print(f"  {_c240}/rollback → undo all changes since plan{C.RESET}")
     print(f"  {_c46}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.RESET}\n")
 
@@ -7606,7 +7612,13 @@ def main():
                                     except OSError:
                                         sz = 0
                                     sz_str = f"{sz:,}B" if sz < 1024 else f"{sz/1024:.1f}KB"
-                                    active = " ◀" if agent._active_plan_path and os.path.samefile(fp, agent._active_plan_path) else ""
+                                    try:
+                                        active = " ◀" if (agent._active_plan_path
+                                                           and os.path.exists(fp)
+                                                           and os.path.exists(agent._active_plan_path)
+                                                           and os.path.samefile(fp, agent._active_plan_path)) else ""
+                                    except (OSError, ValueError):
+                                        active = ""
                                     print(f"  {_c240}{pf}  ({sz_str}){active}{C.RESET}")
                                 print()
                     else:

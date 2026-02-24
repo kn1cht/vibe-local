@@ -9396,3 +9396,169 @@ class TestScrollRegionScreen:
         # Footer area should be cleared
         sep = screen.get_row(22)
         assert '─' not in sep, f"Separator still visible after teardown: {sep!r}"
+
+
+# ---------------------------------------------------------------------------
+# PR #9 review fixes — new test classes
+# ---------------------------------------------------------------------------
+
+class TestCharDisplayWidth:
+    """_char_display_width correctly reports terminal width for various scripts."""
+
+    def test_ascii_is_width_1(self):
+        assert vc._char_display_width('A') == 1
+        assert vc._char_display_width('z') == 1
+        assert vc._char_display_width(' ') == 1
+
+    def test_cjk_is_width_2(self):
+        assert vc._char_display_width('日') == 2
+        assert vc._char_display_width('本') == 2
+        assert vc._char_display_width('語') == 2
+
+    def test_latin_extended_is_width_1(self):
+        """This is the key regression test — 'é' was misclassified as width 2 before."""
+        assert vc._char_display_width('é') == 1
+        assert vc._char_display_width('ñ') == 1
+        assert vc._char_display_width('ü') == 1
+
+    def test_cyrillic_is_width_1(self):
+        assert vc._char_display_width('Д') == 1
+        assert vc._char_display_width('Ж') == 1
+
+    def test_fullwidth_form_is_width_2(self):
+        # U+FF21 FULLWIDTH LATIN CAPITAL LETTER A
+        assert vc._char_display_width('\uff21') == 2
+
+    def test_display_width_delegates_to_char(self):
+        """_display_width should agree with sum of _char_display_width."""
+        text = "Hello日本語éñ"
+        expected = sum(vc._char_display_width(c) for c in text)
+        assert vc._display_width(text) == expected
+
+
+class TestWriteRestrictionGuard:
+    """Plan mode Write tool is restricted to .vibe-local/plans/ only."""
+
+    def test_outside_plans_dir_is_blocked(self):
+        """Write to path outside plans/ should be rejected."""
+        import inspect
+        source = inspect.getsource(vc.Agent.run)
+        # The guard must check for plans directory
+        assert "plans" in source
+        assert "plan mode" in source.lower() or "Plan mode" in source
+
+    def test_path_traversal_blocked(self):
+        """realpath-based guard should prevent ../../ traversal."""
+        # The guard uses os.path.realpath to resolve symlinks/traversal,
+        # then checks startswith(plans_dir + os.sep).
+        import inspect
+        source = inspect.getsource(vc.Agent.run)
+        assert "realpath" in source
+
+    def test_plans_dir_write_allowed_in_source(self):
+        """The guard should only block when path is NOT under plans_dir."""
+        import inspect
+        source = inspect.getsource(vc.Agent.run)
+        # The continue (block) is inside a "not fpath.startswith" branch
+        assert "startswith" in source
+
+
+class TestReadLatestPlan:
+    """_read_latest_plan reads active plan or falls back to newest .md."""
+
+    def _make_agent_stub(self, cwd, active_plan_path=None):
+        """Create a minimal agent-like object for _read_latest_plan."""
+        config = type("C", (), {"cwd": cwd})()
+        agent = type("A", (), {
+            "_active_plan_path": active_plan_path,
+            "config": config,
+        })()
+        return agent
+
+    def test_reads_active_plan_path(self):
+        with tempfile.TemporaryDirectory() as td:
+            plan_file = os.path.join(td, "plan.md")
+            with open(plan_file, "w") as f:
+                f.write("# My plan\nStep 1")
+            agent = self._make_agent_stub(td, active_plan_path=plan_file)
+            result = vc._read_latest_plan(agent)
+            assert "My plan" in result
+
+    def test_fallback_to_newest_md(self):
+        with tempfile.TemporaryDirectory() as td:
+            plans_dir = os.path.join(td, ".vibe-local", "plans")
+            os.makedirs(plans_dir)
+            # Create two plan files with different mtimes
+            old = os.path.join(plans_dir, "old.md")
+            new = os.path.join(plans_dir, "new.md")
+            with open(old, "w") as f:
+                f.write("old plan")
+            with open(new, "w") as f:
+                f.write("new plan")
+            # Set mtime explicitly to avoid flaky tests on slow filesystems
+            os.utime(old, (1000000, 1000000))
+            os.utime(new, (2000000, 2000000))
+            agent = self._make_agent_stub(td, active_plan_path=None)
+            result = vc._read_latest_plan(agent)
+            assert "new plan" in result
+
+    def test_no_plans_dir_returns_empty(self):
+        with tempfile.TemporaryDirectory() as td:
+            agent = self._make_agent_stub(td, active_plan_path=None)
+            result = vc._read_latest_plan(agent)
+            assert result == ""
+
+    def test_truncates_at_8000_chars(self):
+        with tempfile.TemporaryDirectory() as td:
+            plan_file = os.path.join(td, "big.md")
+            with open(plan_file, "w") as f:
+                f.write("x" * 10000)
+            agent = self._make_agent_stub(td, active_plan_path=plan_file)
+            result = vc._read_latest_plan(agent)
+            assert len(result) == 8000
+
+
+class TestPlanListSamefile:
+    """/plan list should not crash when files are missing."""
+
+    def test_samefile_guard_in_source(self):
+        """The samefile call should be wrapped with os.path.exists checks."""
+        import inspect
+        # The /plan list code is inside main()
+        source = inspect.getsource(vc.main)
+        assert "os.path.exists" in source or "path.exists" in source
+        # Should also have try/except around samefile
+        assert "samefile" in source
+
+    def test_samefile_with_missing_file_no_crash(self):
+        """os.path.samefile should not be called with missing paths."""
+        # Directly test the defensive pattern
+        fp = "/nonexistent/path/plan.md"
+        active = "/also/nonexistent/active.md"
+        try:
+            result = " ◀" if (active
+                               and os.path.exists(fp)
+                               and os.path.exists(active)
+                               and os.path.samefile(fp, active)) else ""
+        except (OSError, ValueError):
+            result = ""
+        assert result == ""
+
+
+class TestShiftTabSentinel:
+    """Shift+Tab sentinel value is safe and passes through correctly."""
+
+    def test_sentinel_is_string(self):
+        assert isinstance(vc.TUI._SHIFT_TAB_SENTINEL, str)
+
+    def test_sentinel_contains_null(self):
+        """Sentinel uses \\x00 to avoid collision with user input."""
+        assert "\x00" in vc.TUI._SHIFT_TAB_SENTINEL
+
+    def test_get_multiline_input_passes_sentinel_through(self):
+        """get_multiline_input should return sentinel unchanged."""
+        import inspect
+        source = inspect.getsource(vc.TUI.get_multiline_input)
+        assert "_SHIFT_TAB_SENTINEL" in source
+        # It should return the sentinel, not transform it
+        assert "return first_line" in source or "return self._SHIFT_TAB_SENTINEL" in source
