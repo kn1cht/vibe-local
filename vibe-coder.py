@@ -3462,9 +3462,6 @@ class AskUserQuestionTool(Tool):
         if not question:
             return "Error: question is required"
 
-        # Keep DECSTBM active — input works within the scroll region
-        _sr = _active_scroll_region
-
         with _print_lock:
             print(f"\n{_ansi(C.CYAN)}{_ansi(C.BOLD)}Question:{_ansi(C.RESET)} {question}")
             if options:
