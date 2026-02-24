@@ -554,7 +554,7 @@ class InputMonitor:
 
     def __init__(self, on_typeahead=None):
         self._pressed = threading.Event()
-        self._shift_tab = threading.Event()   # Shift+Tab detected
+
         self._stop_event = threading.Event()
         self._thread = None
         self._old_settings = None
@@ -567,10 +567,6 @@ class InputMonitor:
         """True if ESC was pressed since start()."""
         return self._pressed.is_set()
 
-    @property
-    def shift_tab_pressed(self):
-        """True if Shift+Tab was pressed since start()."""
-        return self._shift_tab.is_set()
 
     def get_typeahead(self):
         """Return and clear any buffered type-ahead text (decoded as utf-8)."""
@@ -589,7 +585,6 @@ class InputMonitor:
         if not HAS_TERMIOS or not sys.stdin.isatty():
             return
         self._pressed.clear()
-        self._shift_tab.clear()
         self._stop_event.clear()
         with self._typeahead_lock:
             self._typeahead.clear()
@@ -633,12 +628,8 @@ class InputMonitor:
                             except (OSError, ValueError):
                                 r3 = []
                             if r3:
-                                ch3 = os.read(fd, 1)
-                                if ch3 == b'Z':
-                                    # Shift+Tab detected
-                                    self._shift_tab.set()
-                                    break
-                                # Other escape sequence — treat as ESC (interrupt)
+                                ch3 = os.read(fd, 1)  # noqa: F841
+                                # Escape sequence (e.g. arrow keys) — treat as ESC (interrupt)
                             # '[' with no follow-up — treat as ESC
                         # Non-'[' after ESC — treat as ESC
                     self._pressed.set()
@@ -5216,7 +5207,6 @@ class TUI:
     # ANSI escape regex for stripping colors from tool output
     _ANSI_RE = re.compile(r'\033\[[0-9;]*[a-zA-Z]')
 
-    _SHIFT_TAB_SENTINEL = "\x00__SHIFT_TAB__\x00"  # sentinel for Shift+Tab in input
 
     def __init__(self, config):
         self.config = config
@@ -5225,7 +5215,7 @@ class TUI:
         self.is_interactive = sys.stdin.isatty() and sys.stdout.isatty()
         self._is_cjk = self._detect_cjk_locale()
         self.scroll_region = ScrollRegion()
-        self._shift_tab_prefill = ""  # text being typed when Shift+Tab pressed
+
         try:
             self._term_cols = shutil.get_terminal_size((80, 24)).columns
         except (ValueError, OSError):
@@ -5388,224 +5378,6 @@ class TUI:
         cjk_prefixes = ("ja", "zh", "ko", "ja_JP", "zh_CN", "zh_TW", "ko_KR")
         return any(lang.startswith(p) for p in cjk_prefixes)
 
-    def _build_prompt_str(self, session=None, plan_mode=False):
-        """Build the prompt string for raw-mode display (not readline).
-
-        Uses _ansi() instead of _rl_ansi() because this string is rendered
-        via sys.stdout.write() in _raw_input_with_shift_tab(), which does not
-        use readline. Readline's \\001/\\002 markers would appear as garbage.
-        """
-        _c226 = _ansi(chr(27) + '[38;5;226m')
-        _c51 = _ansi(chr(27) + '[38;5;51m')
-        _c240 = _ansi("\033[38;5;240m")
-        _c196 = _ansi("\033[38;5;196m")
-        _reset = C.RESET if C._enabled else ""
-
-        plan_tag = f"{_c226}[PLAN]{_reset} " if plan_mode else ""
-        prompt_char = f"{_c226}▸{_reset} " if plan_mode else f"{_c51}❯{_reset} "
-
-        if session:
-            pct = min(int((session.get_token_estimate() / session.config.context_window) * 100), 100)
-            if pct < 50:
-                ctx_color = _c240
-            elif pct < 80:
-                ctx_color = _c226
-            else:
-                ctx_color = _c196
-            return f"{plan_tag}{ctx_color}ctx:{pct}%{_reset} {prompt_char}"
-        return f"{plan_tag}{prompt_char}"
-
-    def _raw_input_with_shift_tab(self, prompt_str, prefill=""):
-        """Custom input loop using tty.setcbreak + os.read.
-        Bypasses readline/libedit entirely to reliably detect Shift+Tab (\\x1b[Z) on macOS.
-        Returns user input string, or _SHIFT_TAB_SENTINEL on Shift+Tab.
-        Returns None on Ctrl+D (EOF).
-        Raises KeyboardInterrupt on Ctrl+C.
-        """
-        fd = sys.stdin.fileno()
-        old_settings = termios.tcgetattr(fd)
-        buf = list(prefill)  # current line buffer (chars)
-        history_idx = -1     # -1 = current line, 0 = most recent history item
-        saved_buf = ""       # saved current line when browsing history
-
-        # Print prompt + prefill
-        sys.stdout.write(prompt_str + prefill)
-        sys.stdout.flush()
-
-        try:
-            tty.setcbreak(fd)
-            while True:
-                try:
-                    ready, _, _ = _select_mod.select([fd], [], [], 0.1)
-                except (OSError, ValueError):
-                    break
-                if not ready:
-                    continue
-
-                ch = os.read(fd, 1)
-                if not ch:
-                    break
-
-                b = ch[0]
-
-                # ── Ctrl+C ──
-                if b == 0x03:
-                    sys.stdout.write("^C\n")
-                    sys.stdout.flush()
-                    raise KeyboardInterrupt
-
-                # ── Ctrl+D (EOF) ──
-                if b == 0x04:
-                    if not buf:
-                        sys.stdout.write("\n")
-                        sys.stdout.flush()
-                        return None
-                    continue  # ignore if buffer non-empty
-
-                # ── Enter ──
-                if b in (0x0A, 0x0D):
-                    sys.stdout.write("\n")
-                    sys.stdout.flush()
-                    line = "".join(buf)
-                    # Add to readline history for persistence
-                    if HAS_READLINE and line.strip():
-                        readline.add_history(line)
-                    return line
-
-                # ── Backspace ──
-                if b in (0x7F, 0x08):
-                    if buf:
-                        # Determine display width of removed char
-                        removed = buf.pop()
-                        w = _char_display_width(removed)
-                        sys.stdout.write("\b" * w + " " * w + "\b" * w)
-                        sys.stdout.flush()
-                    continue
-
-                # ── Ctrl+U (kill line) ──
-                if b == 0x15:
-                    if buf:
-                        # Calculate display width and clear
-                        dw = sum(_char_display_width(c) for c in buf)
-                        sys.stdout.write("\b" * dw + " " * dw + "\b" * dw)
-                        sys.stdout.flush()
-                        buf.clear()
-                    continue
-
-                # ── Ctrl+W (kill word) ──
-                if b == 0x17:
-                    if buf:
-                        # Remove trailing spaces then word chars
-                        removed_width = 0
-                        while buf and buf[-1] == " ":
-                            buf.pop()
-                            removed_width += 1
-                        while buf and buf[-1] != " ":
-                            c = buf.pop()
-                            removed_width += _char_display_width(c)
-                        sys.stdout.write("\b" * removed_width + " " * removed_width + "\b" * removed_width)
-                        sys.stdout.flush()
-                    continue
-
-                # ── ESC sequence ──
-                if b == 0x1B:
-                    # Read next char with short timeout
-                    try:
-                        r2, _, _ = _select_mod.select([fd], [], [], 0.05)
-                    except (OSError, ValueError):
-                        r2 = []
-                    if r2:
-                        ch2 = os.read(fd, 1)
-                        if ch2 == b'[':
-                            try:
-                                r3, _, _ = _select_mod.select([fd], [], [], 0.05)
-                            except (OSError, ValueError):
-                                r3 = []
-                            if r3:
-                                ch3 = os.read(fd, 1)
-                                if ch3 == b'Z':
-                                    # Shift+Tab detected!
-                                    sys.stdout.write("\n")
-                                    sys.stdout.flush()
-                                    self._shift_tab_prefill = "".join(buf)
-                                    return self._SHIFT_TAB_SENTINEL
-                                elif ch3 == b'A':
-                                    # Up arrow — browse history
-                                    if HAS_READLINE:
-                                        max_idx = readline.get_current_history_length()
-                                        if history_idx < max_idx - 1:
-                                            if history_idx == -1:
-                                                saved_buf = "".join(buf)
-                                            history_idx += 1
-                                            item = readline.get_history_item(max_idx - history_idx) or ""
-                                            # Clear current line and show history item
-                                            dw = sum(_char_display_width(c) for c in buf)
-                                            sys.stdout.write("\b" * dw + " " * dw + "\b" * dw)
-                                            buf = list(item)
-                                            sys.stdout.write(item)
-                                            sys.stdout.flush()
-                                    continue
-                                elif ch3 == b'B':
-                                    # Down arrow — browse history forward
-                                    if HAS_READLINE:
-                                        if history_idx > -1:
-                                            history_idx -= 1
-                                            if history_idx == -1:
-                                                item = saved_buf
-                                            else:
-                                                max_idx = readline.get_current_history_length()
-                                                item = readline.get_history_item(max_idx - history_idx) or ""
-                                            dw = sum(_char_display_width(c) for c in buf)
-                                            sys.stdout.write("\b" * dw + " " * dw + "\b" * dw)
-                                            buf = list(item)
-                                            sys.stdout.write(item)
-                                            sys.stdout.flush()
-                                    continue
-                                # Other escape sequences (e.g., Left/Right) — ignore for now
-                            continue
-                        # Alt+key or other — ignore
-                    # Bare ESC — ignore in input mode
-                    continue
-
-                # ── UTF-8 multibyte ──
-                if b >= 0x80:
-                    # Determine how many continuation bytes we need
-                    if b & 0xE0 == 0xC0:
-                        remaining = 1
-                    elif b & 0xF0 == 0xE0:
-                        remaining = 2
-                    elif b & 0xF8 == 0xF0:
-                        remaining = 3
-                    else:
-                        continue  # invalid UTF-8 leader
-                    raw = bytes([b])
-                    for _ in range(remaining):
-                        try:
-                            r, _, _ = _select_mod.select([fd], [], [], 0.1)
-                        except (OSError, ValueError):
-                            r = []
-                        if r:
-                            raw += os.read(fd, 1)
-                    try:
-                        char = raw.decode("utf-8")
-                    except UnicodeDecodeError:
-                        continue
-                    buf.append(char)
-                    sys.stdout.write(char)
-                    sys.stdout.flush()
-                    continue
-
-                # ── Normal printable ASCII ──
-                if 0x20 <= b < 0x7F:
-                    char = chr(b)
-                    buf.append(char)
-                    sys.stdout.write(char)
-                    sys.stdout.flush()
-                    continue
-
-                # Other control chars — ignore
-        finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
     def show_input_separator(self, plan_mode=False):
         """Print a subtle separator line before the input prompt.
@@ -5630,7 +5402,7 @@ class TUI:
 
         Always uses standard input() for readline features (history, cursor
         movement, Ctrl+A/E, tab completion). Mode switching is done via
-        /plan command or Shift+Tab during agent execution (InputMonitor).
+        /plan and /approve commands.
         """
 
         # Fallback: standard input() with readline
@@ -5681,8 +5453,6 @@ class TUI:
             first_line = self.get_input(session=session, plan_mode=plan_mode, prefill=prefill)
             if first_line is None:
                 return None
-            if first_line == self._SHIFT_TAB_SENTINEL:
-                return first_line  # pass sentinel through to main loop
             if first_line.strip() == '"""':
                 # Explicit multi-line mode
                 lines = []
@@ -6378,7 +6148,7 @@ class Agent:
         self._tui_lock = threading.Lock()
         self._plan_mode = False
         self._active_plan_path = None     # current plan file path
-        self._shift_tab_toggle = False    # Shift+Tab mode toggle flag
+
         self.git_checkpoint = GitCheckpoint(config.cwd)
         self.auto_test = AutoTestRunner(config.cwd)
         self.file_watcher = FileWatcher(config.cwd)
@@ -6449,10 +6219,6 @@ class Agent:
         _esc_monitor.start()
 
         for iteration in range(self.MAX_ITERATIONS):
-            # Shift+Tab during agent execution → toggle plan/act mode
-            if _esc_monitor.shift_tab_pressed:
-                self._shift_tab_toggle = True
-                break
             if self._interrupted.is_set() or _esc_monitor.pressed:
                 if _esc_monitor.pressed:
                     _p(f"\n{C.YELLOW}Stopped (ESC pressed).{C.RESET}")
@@ -7229,16 +6995,6 @@ def main():
             if user_input is None:
                 break
 
-            # Shift+Tab sentinel — toggle plan/act mode and restore prefill
-            if user_input == TUI._SHIFT_TAB_SENTINEL:
-                if agent._plan_mode:
-                    _exit_plan_mode(agent, session)
-                else:
-                    _enter_plan_mode(agent, session)
-                _typeahead_text = tui._shift_tab_prefill
-                tui._shift_tab_prefill = ""
-                continue
-
             user_input = user_input.strip()
             if not user_input:
                 continue
@@ -7785,13 +7541,6 @@ def main():
 
             # Run agent
             agent.run(user_input)
-            # Check if Shift+Tab was pressed during agent execution
-            if agent._shift_tab_toggle:
-                agent._shift_tab_toggle = False
-                if agent._plan_mode:
-                    _exit_plan_mode(agent, session)
-                else:
-                    _enter_plan_mode(agent, session)
             # Capture type-ahead for next prompt (text typed during execution)
             _typeahead_text = agent.get_typeahead()
             if _typeahead_text:

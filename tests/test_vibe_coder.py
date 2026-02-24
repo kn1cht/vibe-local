@@ -9545,24 +9545,6 @@ class TestPlanListSamefile:
         assert result == ""
 
 
-class TestShiftTabSentinel:
-    """Shift+Tab sentinel value is safe and passes through correctly."""
-
-    def test_sentinel_is_string(self):
-        assert isinstance(vc.TUI._SHIFT_TAB_SENTINEL, str)
-
-    def test_sentinel_contains_null(self):
-        """Sentinel uses \\x00 to avoid collision with user input."""
-        assert "\x00" in vc.TUI._SHIFT_TAB_SENTINEL
-
-    def test_get_multiline_input_passes_sentinel_through(self):
-        """get_multiline_input should return sentinel unchanged."""
-        import inspect
-        source = inspect.getsource(vc.TUI.get_multiline_input)
-        assert "_SHIFT_TAB_SENTINEL" in source
-        # It should return the sentinel, not transform it
-        assert "return first_line" in source or "return self._SHIFT_TAB_SENTINEL" in source
-
 
 # ═══════════════════════════════════════════════════════════════════════════
 # PR #9 Coverage Holes
