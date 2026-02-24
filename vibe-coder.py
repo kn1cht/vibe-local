@@ -1950,6 +1950,9 @@ class RAGEngine:
         conn = sqlite3.connect(self.db_path)
         try:
             # Phase 1: path と embedding のみフェッチしてスコアリング（content は不要）
+            # Note: embedding BLOB は全チャンク分をメモリにロードする。大規模インデックス
+            # （数万チャンク超）ではこれ自体がボトルネックになり得るが、完全な解決には
+            # 外部ベクトルDB（sqlite-vec 等）が必要なため、現バージョンの既知の制限とする。
             rows = conn.execute(
                 "SELECT path, chunk_index, embedding FROM documents"
             ).fetchall()
@@ -5221,7 +5224,7 @@ class Session:
             text = encoded[:max_bytes].decode("utf-8", errors="ignore")
             text += "\n... [RAG context truncated]"
         self.messages.append({"role": "user", "content": f"[RAG Context]\n{text}"})
-        self._token_estimate += self._estimate_tokens(text)
+        self._token_estimate += self._estimate_tokens(f"[RAG Context]\n{text}")
 
     def add_assistant_message(self, text, tool_calls=None):
         msg = {"role": "assistant", "content": text if text else None}

@@ -7746,9 +7746,7 @@ class TestStreamingEnhancement:
 
     def test_session_add_rag_context_exists(self):
         """Session should have add_rag_context method."""
-        with open(os.path.join(VIBE_LOCAL_DIR, "vibe-coder.py")) as f:
-            content = f.read()
-        assert "def add_rag_context" in content
+        assert hasattr(vc.Session, "add_rag_context")
 
     def test_session_add_rag_context_normal(self):
         """add_rag_context should add message with [RAG Context] marker."""
