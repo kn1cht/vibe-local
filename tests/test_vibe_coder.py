@@ -7744,6 +7744,42 @@ class TestStreamingEnhancement:
             content = f.read()
         assert "def add_system_note" in content
 
+    def test_session_add_rag_context_exists(self):
+        """Session should have add_rag_context method."""
+        with open(os.path.join(VIBE_LOCAL_DIR, "vibe-coder.py")) as f:
+            content = f.read()
+        assert "def add_rag_context" in content
+
+    def test_session_add_rag_context_normal(self):
+        """add_rag_context should add message with [RAG Context] marker."""
+        with tempfile.TemporaryDirectory() as d:
+            cfg = vc.Config()
+            cfg.sessions_dir = d
+            cfg.context_window = 32768
+            cfg.session_id = None
+            session = vc.Session(cfg, "system prompt")
+            session.add_rag_context("some code context")
+            last = session.messages[-1]
+            assert last["role"] == "user"
+            assert "[RAG Context]\n" in last["content"]
+            assert "some code context" in last["content"]
+            assert "[RAG context truncated]" not in last["content"]
+
+    def test_session_add_rag_context_truncates_large_input(self):
+        """add_rag_context should truncate input exceeding max_bytes."""
+        with tempfile.TemporaryDirectory() as d:
+            cfg = vc.Config()
+            cfg.sessions_dir = d
+            cfg.context_window = 32768
+            cfg.session_id = None
+            session = vc.Session(cfg, "system prompt")
+            large_text = "x" * 40_000  # 40 KB > default 32 KB limit
+            session.add_rag_context(large_text)
+            last = session.messages[-1]
+            assert last["role"] == "user"
+            assert "[RAG Context]" in last["content"]
+            assert "[RAG context truncated]" in last["content"]
+
 
 class TestStreamingAutoDetection:
     """Tests for Ollama version-based tool streaming auto-detection."""

@@ -859,8 +859,8 @@ class Config:
         parser.add_argument("--rag-mode", choices=["query"], default="query",
                             help="RAG mode (default: query)")
         parser.add_argument("--rag-path", help="Path to use for RAG context")
-        parser.add_argument("--rag-topk", type=int, default=5,
-                            help="Number of top results for RAG (default: 5)")
+        parser.add_argument("--rag-topk", type=int, default=None,
+                            help="Number of top results for RAG (default: 5 when not specified)")
         parser.add_argument("--rag-model", default="nomic-embed-text",
                             help="Ollama embedding model (default: nomic-embed-text)")
         parser.add_argument("--rag-index", metavar="PATH",
@@ -1723,20 +1723,22 @@ class RAGEngine:
         """Create SQLite database and tables if needed."""
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
         conn = sqlite3.connect(self.db_path)
-        conn.execute("""CREATE TABLE IF NOT EXISTS documents (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            path TEXT NOT NULL,
-            chunk_index INTEGER NOT NULL,
-            content TEXT NOT NULL,
-            embedding BLOB NOT NULL,
-            file_hash TEXT NOT NULL,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(path, chunk_index)
-        )""")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_doc_path ON documents(path)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_doc_hash ON documents(file_hash)")
-        conn.commit()
-        conn.close()
+        try:
+            conn.execute("""CREATE TABLE IF NOT EXISTS documents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                path TEXT NOT NULL,
+                chunk_index INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                embedding BLOB NOT NULL,
+                file_hash TEXT NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(path, chunk_index)
+            )""")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_doc_path ON documents(path)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_doc_hash ON documents(file_hash)")
+            conn.commit()
+        finally:
+            conn.close()
 
     # ── Embedding ─────────────────────────────────────────────────────────────
 
@@ -1872,56 +1874,58 @@ class RAGEngine:
             return 0, 0, 0
 
         conn = sqlite3.connect(self.db_path)
-        indexed, skipped, errors = 0, 0, 0
+        try:
+            indexed, skipped, errors = 0, 0, 0
 
-        for fpath in files:
-            rel_path = os.path.relpath(fpath, self.config.cwd)
-            try:
-                fhash = self._file_hash(fpath)
+            for fpath in files:
+                rel_path = os.path.relpath(fpath, self.config.cwd)
+                try:
+                    fhash = self._file_hash(fpath)
 
-                # Skip if already indexed with same hash
-                row = conn.execute(
-                    "SELECT file_hash FROM documents WHERE path = ? LIMIT 1",
-                    (rel_path,),
-                ).fetchone()
-                if row and row[0] == fhash:
-                    skipped += 1
-                    continue
-
-                # Remove stale entries
-                conn.execute("DELETE FROM documents WHERE path = ?", (rel_path,))
-
-                with open(fpath, "r", errors="replace") as f:
-                    content = f.read()
-                if not content.strip():
-                    skipped += 1
-                    continue
-
-                chunks = self._chunk_text(content)
-                for i, chunk in enumerate(chunks):
-                    if not chunk.strip():
+                    # Skip if already indexed with same hash
+                    row = conn.execute(
+                        "SELECT file_hash FROM documents WHERE path = ? LIMIT 1",
+                        (rel_path,),
+                    ).fetchone()
+                    if row and row[0] == fhash:
+                        skipped += 1
                         continue
-                    embedding = self._get_embedding(chunk)
-                    emb_blob = self._serialize_embedding(embedding)
-                    conn.execute(
-                        "INSERT OR REPLACE INTO documents "
-                        "(path, chunk_index, content, embedding, file_hash) "
-                        "VALUES (?, ?, ?, ?, ?)",
-                        (rel_path, i, chunk, emb_blob, fhash),
-                    )
 
-                conn.commit()
-                indexed += 1
-                if verbose:
-                    print(f"  {C.GREEN}✓{C.RESET} {rel_path} ({len(chunks)} chunks)")
+                    # Remove stale entries
+                    conn.execute("DELETE FROM documents WHERE path = ?", (rel_path,))
 
-            except Exception as e:
-                errors += 1
-                if verbose:
-                    print(f"  {C.RED}✗{C.RESET} {rel_path}: {e}")
+                    with open(fpath, "r", errors="replace") as f:
+                        content = f.read()
+                    if not content.strip():
+                        skipped += 1
+                        continue
 
-        conn.commit()
-        conn.close()
+                    chunks = self._chunk_text(content)
+                    for i, chunk in enumerate(chunks):
+                        if not chunk.strip():
+                            continue
+                        embedding = self._get_embedding(chunk)
+                        emb_blob = self._serialize_embedding(embedding)
+                        conn.execute(
+                            "INSERT OR REPLACE INTO documents "
+                            "(path, chunk_index, content, embedding, file_hash) "
+                            "VALUES (?, ?, ?, ?, ?)",
+                            (rel_path, i, chunk, emb_blob, fhash),
+                        )
+
+                    conn.commit()
+                    indexed += 1
+                    if verbose:
+                        print(f"  {C.GREEN}✓{C.RESET} {rel_path} ({len(chunks)} chunks)")
+
+                except Exception as e:
+                    errors += 1
+                    if verbose:
+                        print(f"  {C.RED}✗{C.RESET} {rel_path}: {e}")
+
+            conn.commit()
+        finally:
+            conn.close()
 
         if verbose:
             print(f"\n{C.GREEN}Indexing complete:{C.RESET} "
@@ -1944,22 +1948,37 @@ class RAGEngine:
         query_emb = self._get_embedding(query_text)
 
         conn = sqlite3.connect(self.db_path)
-        rows = conn.execute(
-            "SELECT path, content, embedding FROM documents"
-        ).fetchall()
-        conn.close()
+        try:
+            # Phase 1: path と embedding のみフェッチしてスコアリング（content は不要）
+            rows = conn.execute(
+                "SELECT path, chunk_index, embedding FROM documents"
+            ).fetchall()
 
-        if not rows:
-            return []
+            if not rows:
+                return []
 
-        results = []
-        for path, content, emb_blob in rows:
-            emb = self._deserialize_embedding(emb_blob)
-            sim = self._cosine_similarity(query_emb, emb)
-            results.append((sim, path, content))
+            scored = []
+            for path, chunk_index, emb_blob in rows:
+                emb = self._deserialize_embedding(emb_blob)
+                sim = self._cosine_similarity(query_emb, emb)
+                scored.append((sim, path, chunk_index))
 
-        results.sort(key=lambda x: x[0], reverse=True)
-        return [(path, content, sim) for sim, path, content in results[:top_k]]
+            scored.sort(key=lambda x: x[0], reverse=True)
+            top = scored[:top_k]
+
+            # Phase 2: top-k チャンクの content のみ取得
+            results = []
+            for sim, path, chunk_index in top:
+                row = conn.execute(
+                    "SELECT content FROM documents WHERE path = ? AND chunk_index = ?",
+                    (path, chunk_index),
+                ).fetchone()
+                if row:
+                    results.append((path, row[0], sim))
+
+            return results
+        finally:
+            conn.close()
 
     def format_context(self, results):
         """Format query results as context block for system prompt injection."""
@@ -1980,9 +1999,11 @@ class RAGEngine:
         if not os.path.exists(self.db_path):
             return {"chunks": 0, "files": 0, "db_size": 0}
         conn = sqlite3.connect(self.db_path)
-        chunks = conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
-        files = conn.execute("SELECT COUNT(DISTINCT path) FROM documents").fetchone()[0]
-        conn.close()
+        try:
+            chunks = conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
+            files = conn.execute("SELECT COUNT(DISTINCT path) FROM documents").fetchone()[0]
+        finally:
+            conn.close()
         db_size = os.path.getsize(self.db_path)
         return {"chunks": chunks, "files": files, "db_size": db_size}
 
@@ -5189,6 +5210,19 @@ class Session:
         self.messages.append({"role": "user", "content": f"[System Note] {text}"})
         self._token_estimate += self._estimate_tokens(text)
 
+    def add_rag_context(self, text, max_bytes=32_000):
+        """Add RAG-retrieved context as a user message, with a size guard.
+
+        Uses a dedicated marker ([RAG Context]) to distinguish multi-KB code
+        context from brief [System Note] notifications.
+        """
+        encoded = text.encode("utf-8")
+        if len(encoded) > max_bytes:
+            text = encoded[:max_bytes].decode("utf-8", errors="ignore")
+            text += "\n... [RAG context truncated]"
+        self.messages.append({"role": "user", "content": f"[RAG Context]\n{text}"})
+        self._token_estimate += self._estimate_tokens(text)
+
     def add_assistant_message(self, text, tool_calls=None):
         msg = {"role": "assistant", "content": text if text else None}
         if tool_calls:
@@ -6518,6 +6552,8 @@ class Agent:
         _p = self.tui._scroll_print  # scroll-region-safe print
 
         # Auto-parallel detection: if user asks multiple independent tasks, run them in parallel
+        # Known limitation: RAG context is not injected when auto-parallel fires, because
+        # this branch returns early before the RAG injection block below.
         if not self._plan_mode:
             parallel_tasks = self._detect_parallel_tasks(user_input)
             if len(parallel_tasks) >= 2:
@@ -6539,7 +6575,7 @@ class Agent:
                 results = self.rag_engine.query(user_input)
                 if results:
                     ctx = self.rag_engine.format_context(results)
-                    self.session.add_system_note(ctx)
+                    self.session.add_rag_context(ctx)
                     if self.config.debug:
                         print(f"{C.DIM}[debug] RAG: injected {len(results)} chunks{C.RESET}",
                               file=sys.stderr)
