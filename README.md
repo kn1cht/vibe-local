@@ -534,7 +534,7 @@ VIBE_DEBUG_TUI=1 vibe-local
 │  │  Multimodal (image base64 → Ollama vision models)    │  │
 │  └──────────────────────┬───────────────────────────────┘  │
 └─────────────────────────┼──────────────────────────────────┘
-                          │  OpenAI Chat API (/v1/chat/completions)
+                          │  Ollama native API (/api/chat)
                           ▼
 ┌────────────────────────────────────────────────────────────┐
 │  Ollama (localhost:11434)                                   │

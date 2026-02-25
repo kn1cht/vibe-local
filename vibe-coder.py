@@ -1330,11 +1330,11 @@ IMPORTANT — This is Windows (NOT Linux/macOS):
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-# OllamaClient — Direct communication with Ollama OpenAI-compatible API
+# OllamaClient — Direct communication with Ollama API
 # ════════════════════════════════════════════════════════════════════════════════
 
 class OllamaClient:
-    """Communicates with Ollama via /v1/chat/completions."""
+    """Communicates with Ollama API"""
 
     def __init__(self, config):
         self.base_url = config.ollama_host
@@ -1468,33 +1468,56 @@ class OllamaClient:
         payload = {
             "model": model,
             "messages": messages,
-            "max_tokens": self.max_tokens,
-            "temperature": self.temperature,
             "stream": stream,
             "keep_alive": -1,  # Keep model loaded in VRAM for the session
-            "options": {"num_ctx": self.context_window},  # Tell Ollama our context budget
+            "options": {
+                "num_ctx": self.context_window,  # Tell Ollama our context budget
+                "num_predict": self.max_tokens,
+                "temperature": self.temperature,
+            },
         }
         if tools:
             payload["tools"] = tools
-            payload["tool_choice"] = "auto"
             # Lower temperature for tool-calling (improves JSON reliability)
-            payload["temperature"] = min(self.temperature, 0.3)
+            payload["options"]["temperature"] = min(self.temperature, 0.3)
             # Auto-detect streaming with tools (Ollama 0.5+ supports this)
             if not self.detect_tool_streaming():
                 if stream:
                     payload["stream"] = False
                     stream = False
 
-        body = json.dumps(payload).encode("utf-8")
+        # Ollama native /api/chat expects tool_calls[].function.arguments as a dict,
+        # but we store them as JSON strings (OpenAI format). Convert before sending.
+        converted_messages = []
+        for msg in messages:
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                new_tcs = []
+                for tc in msg["tool_calls"]:
+                    func = tc.get("function", {})
+                    args = func.get("arguments", {})
+                    if isinstance(args, str):
+                        try:
+                            args = json.loads(args)
+                        except (json.JSONDecodeError, ValueError):
+                            args = {}
+                    new_tcs.append({
+                        **tc,
+                        "function": {**func, "arguments": args},
+                    })
+                msg = {**msg, "tool_calls": new_tcs}
+            converted_messages.append(msg)
+
+        body = json.dumps({**payload, "messages": converted_messages}).encode("utf-8")
+
         req = urllib.request.Request(
-            f"{self.base_url}/v1/chat/completions",
+            f"{self.base_url}/api/chat",
             data=body,
             headers={"Content-Type": "application/json"},
             method="POST",
         )
 
         if self.debug:
-            print(f"{C.DIM}[debug] POST {self.base_url}/v1/chat/completions "
+            print(f"{C.DIM}[debug] POST {self.base_url}/api/chat "
                   f"model={model} msgs={len(messages)} tools={len(tools or [])} "
                   f"stream={stream}{C.RESET}", file=sys.stderr)
 
@@ -1569,9 +1592,12 @@ class OllamaClient:
                 while b"\n" in buf:
                     line_bytes, buf = buf.split(b"\n", 1)
                     line = line_bytes.decode("utf-8", errors="replace").strip()
-                    if not line.startswith("data: "):
+                    if not line:
                         continue
-                    data_str = line[6:]
+                    if line.startswith("data: "):
+                        data_str = line[6:]
+                    else:
+                        data_str = line
                     if data_str == "[DONE]":
                         got_done = True
                         return
@@ -1621,8 +1647,11 @@ class OllamaClient:
             where each tool_call has keys: id, name, arguments (already parsed dict).
         """
         resp = self.chat(model=model, messages=messages, tools=tools, stream=False)
-        choice = resp.get("choices", [{}])[0]
-        message = choice.get("message", {})
+        if "message" in resp:
+            message = resp.get("message", {})
+        else:
+            choice = resp.get("choices", [{}])[0]
+            message = choice.get("message", {})
         content = message.get("content", "") or ""
         raw_tool_calls = message.get("tool_calls", [])
 
@@ -5494,7 +5523,7 @@ class TUI:
             # Scroll region stays active — no teardown/setup needed.
             pass
 
-    def stream_response(self, response_iter):
+    def stream_response(self, response_iter, known_tools=None):
         """Stream LLM response to terminal. Returns (text, tool_calls).
 
         Handles both text content and tool_call deltas from streaming responses.
@@ -5540,8 +5569,11 @@ class TUI:
                 _status_line_shown = False
 
         for chunk in response_iter:
-            choice = chunk.get("choices", [{}])[0]
-            delta = choice.get("delta", {})
+            if "message" in chunk:
+                delta = chunk.get("message", {})
+            else:
+                choice = chunk.get("choices", [{}])[0]
+                delta = choice.get("delta", {})
 
             # Accumulate tool call deltas (streamed tool calling)
             for tc_delta in delta.get("tool_calls", []):
@@ -5643,12 +5675,23 @@ class TUI:
                         "arguments": tc["function"]["arguments"],
                     },
                 })
+        
+        # Check for XML tool calls in text (Qwen fallback)
+        if not streamed_tool_calls and full_text and known_tools:
+            extracted, cleaned = _extract_tool_calls_from_text(full_text, known_tools)
+            if extracted:
+                streamed_tool_calls = extracted
+                full_text = cleaned
+
         return full_text, streamed_tool_calls
 
     def show_sync_response(self, data, known_tools=None):
         """Display a sync (non-streaming) response. Returns (text, tool_calls)."""
-        choice = data.get("choices", [{}])[0]
-        message = choice.get("message", {})
+        if "message" in data:
+            message = data.get("message", {})
+        else:
+            choice = data.get("choices", [{}])[0]
+            message = choice.get("message", {})
         content = message.get("content", "") or ""
         tool_calls = message.get("tool_calls", [])
 
@@ -6284,7 +6327,9 @@ class Agent:
                 else:
                     # Streaming response — ensure generator is closed on exit
                     try:
-                        text, tool_calls = self.tui.stream_response(response)
+                        text, tool_calls = self.tui.stream_response(
+                            response, known_tools=self.registry.names()
+                        )
                     finally:
                         if hasattr(response, 'close'):
                             response.close()

@@ -1270,7 +1270,7 @@ class TestOllamaClient:
         client = self._make_client()
         import urllib.error
         error = urllib.error.HTTPError(
-            url="http://localhost:11434/v1/chat/completions",
+            url="http://localhost:11434/api/chat",
             code=404,
             msg="Not Found",
             hdrs=None,
@@ -2728,7 +2728,7 @@ class TestOllamaClientChatErrors:
         client = self._make_client()
         import urllib.error
         error = urllib.error.HTTPError(
-            url="http://localhost:11434/v1/chat/completions",
+            url="http://localhost:11434/api/chat",
             code=400, msg="Bad Request", hdrs=None,
             fp=mock.MagicMock(read=mock.MagicMock(return_value=b"context length exceeded")),
         )
@@ -2740,7 +2740,7 @@ class TestOllamaClientChatErrors:
         client = self._make_client()
         import urllib.error
         error = urllib.error.HTTPError(
-            url="http://localhost:11434/v1/chat/completions",
+            url="http://localhost:11434/api/chat",
             code=500, msg="Internal Server Error", hdrs=None,
             fp=mock.MagicMock(read=mock.MagicMock(return_value=b"internal error")),
         )
@@ -2783,7 +2783,7 @@ class TestChatToolModePayload:
             client.chat("model", [{"role": "user", "content": "hi"}], tools=tools, stream=True)
 
         assert captured["data"]["stream"] is False
-        assert captured["data"]["temperature"] <= 0.3
+        assert captured["data"]["options"]["temperature"] <= 0.3
 
 
 class TestEditToolValidation:

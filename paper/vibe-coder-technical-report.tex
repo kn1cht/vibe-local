@@ -101,7 +101,7 @@ However, these tools share common limitations:
 \begin{itemize}[nosep]
   \item \textbf{Single file}: The entire agent is one Python file (\texttt{vibe-coder.py}), copyable via \texttt{scp} or USB stick.
   \item \textbf{Stdlib only}: Zero external Python dependencies---no \texttt{pip install} required.
-  \item \textbf{Direct Ollama}: Communicates with Ollama's OpenAI-compatible API; no proxy process needed.
+  \item \textbf{Direct Ollama}: Communicates with Ollama's native API (\texttt{/api/chat}); no proxy process needed.
   \item \textbf{Offline-first}: All functionality works without internet (except WebFetch/WebSearch).
   \item \textbf{CJK-native}: Full support for Japanese, Chinese, and Korean input, display, and search.
 \end{itemize}
