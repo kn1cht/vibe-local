@@ -6018,11 +6018,13 @@ class TUI:
             # Scroll region stays active — no teardown/setup needed.
             pass
 
-    def stream_response(self, response_iter):
+    def stream_response(self, response_iter, known_tools=None):
         """Stream LLM response to terminal. Returns (text, tool_calls).
 
         Handles both text content and tool_call deltas from streaming responses.
         Tool calls are accumulated from delta chunks (OpenAI-compatible format).
+        If no native tool_calls are found, falls back to XML extraction from text
+        (Qwen models sometimes emit tool calls as XML in the response text).
         """
         raw_parts = []
         in_think = False
@@ -6167,6 +6169,15 @@ class TUI:
                         "arguments": tc["function"]["arguments"],
                     },
                 })
+
+        # Fallback: check for XML tool calls in text (Qwen models sometimes
+        # emit tool calls as raw XML instead of structured tool_calls)
+        if not streamed_tool_calls and full_text and known_tools:
+            extracted, cleaned = _extract_tool_calls_from_text(full_text, known_tools)
+            if extracted:
+                streamed_tool_calls = extracted
+                full_text = cleaned
+
         return full_text, streamed_tool_calls
 
     def show_sync_response(self, data, known_tools=None):
@@ -6825,7 +6836,9 @@ class Agent:
                 else:
                     # Streaming response — ensure generator is closed on exit
                     try:
-                        text, tool_calls = self.tui.stream_response(response)
+                        text, tool_calls = self.tui.stream_response(
+                            response, known_tools=self.registry.names()
+                        )
                     finally:
                         if hasattr(response, 'close'):
                             response.close()
