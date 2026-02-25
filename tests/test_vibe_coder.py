@@ -1270,7 +1270,7 @@ class TestOllamaClient:
         client = self._make_client()
         import urllib.error
         error = urllib.error.HTTPError(
-            url="http://localhost:11434/v1/chat/completions",
+            url="http://localhost:11434/api/chat",
             code=404,
             msg="Not Found",
             hdrs=None,
@@ -1305,6 +1305,172 @@ class TestGetRamGb:
         with mock.patch("platform.system", side_effect=Exception("boom")):
             result = vc._get_ram_gb()
         assert result == 16
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 14b. _get_vram_gb
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestGetVramGb:
+
+    def test_macos_returns_zero(self):
+        """On macOS (Apple Silicon unified memory), VRAM detection should return 0."""
+        with mock.patch("platform.system", return_value="Darwin"):
+            result = vc._get_vram_gb()
+        assert result == 0
+
+    def test_nvidia_smi_not_found(self):
+        """When nvidia-smi is not installed, should return 0."""
+        with mock.patch("platform.system", return_value="Linux"):
+            with mock.patch("subprocess.run", side_effect=FileNotFoundError):
+                result = vc._get_vram_gb()
+        assert result == 0
+
+    def test_nvidia_smi_success(self):
+        """Should parse nvidia-smi output and return VRAM in GB."""
+        fake_result = mock.MagicMock()
+        fake_result.returncode = 0
+        fake_result.stdout = "24576\n"  # 24GB in MiB
+        with mock.patch("platform.system", return_value="Linux"):
+            with mock.patch("subprocess.run", return_value=fake_result):
+                result = vc._get_vram_gb()
+        assert result == 24
+
+    def test_nvidia_smi_multi_gpu(self):
+        """With multiple GPUs, should return the largest VRAM."""
+        fake_result = mock.MagicMock()
+        fake_result.returncode = 0
+        fake_result.stdout = "24576\n49152\n"  # 24GB + 48GB
+        with mock.patch("platform.system", return_value="Linux"):
+            with mock.patch("subprocess.run", return_value=fake_result):
+                result = vc._get_vram_gb()
+        assert result == 48
+
+    def test_nvidia_smi_error(self):
+        """When nvidia-smi returns error, should return 0."""
+        fake_result = mock.MagicMock()
+        fake_result.returncode = 1
+        fake_result.stdout = ""
+        with mock.patch("platform.system", return_value="Linux"):
+            with mock.patch("subprocess.run", return_value=fake_result):
+                result = vc._get_vram_gb()
+        assert result == 0
+
+    def test_nvidia_smi_timeout(self):
+        """When nvidia-smi times out, should return 0."""
+        import subprocess
+        with mock.patch("platform.system", return_value="Windows"):
+            with mock.patch("subprocess.run", side_effect=subprocess.TimeoutExpired("nvidia-smi", 5)):
+                result = vc._get_vram_gb()
+        assert result == 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 14c. Native API conversion helpers
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestNativeApiConversion:
+
+    def test_prepare_messages_converts_tool_call_args(self):
+        """Tool call arguments should be converted from string to dict."""
+        messages = [
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "call_1", "type": "function", "function": {
+                    "name": "Read", "arguments": '{"file_path": "/tmp/a.txt"}'
+                }}
+            ]},
+        ]
+        result = vc.OllamaClient._prepare_messages_for_native(messages)
+        tc = result[0]["tool_calls"][0]
+        assert tc["function"]["arguments"] == {"file_path": "/tmp/a.txt"}
+        assert tc["function"]["name"] == "Read"
+
+    def test_prepare_messages_converts_image_content(self):
+        """Multipart image content should be converted to native images field."""
+        messages = [
+            {"role": "user", "content": [
+                {"type": "text", "text": "What is this?"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+            ]},
+        ]
+        result = vc.OllamaClient._prepare_messages_for_native(messages)
+        assert result[0]["content"] == "What is this?"
+        assert result[0]["images"] == ["AAAA"]
+
+    def test_prepare_messages_passthrough_normal(self):
+        """Normal messages should pass through unchanged."""
+        messages = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"},
+        ]
+        result = vc.OllamaClient._prepare_messages_for_native(messages)
+        assert result[0]["content"] == "hello"
+        assert result[1]["content"] == "hi"
+
+    def test_native_to_openai_response_basic(self):
+        """Native response should be converted to OpenAI format."""
+        native = {
+            "message": {"role": "assistant", "content": "Hello!"},
+            "done": True,
+            "eval_count": 5,
+            "prompt_eval_count": 10,
+        }
+        result = vc.OllamaClient._native_to_openai_response(native)
+        assert result["choices"][0]["message"]["content"] == "Hello!"
+        assert result["usage"]["prompt_tokens"] == 10
+        assert result["usage"]["completion_tokens"] == 5
+
+    def test_native_to_openai_response_tool_calls(self):
+        """Native tool calls should be converted to OpenAI format with string arguments."""
+        native = {
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"function": {"name": "Read", "arguments": {"file_path": "/tmp/a.txt"}}},
+                ],
+            },
+            "done": True,
+        }
+        result = vc.OllamaClient._native_to_openai_response(native)
+        tcs = result["choices"][0]["message"]["tool_calls"]
+        assert len(tcs) == 1
+        assert tcs[0]["function"]["name"] == "Read"
+        assert tcs[0]["type"] == "function"
+        assert tcs[0]["id"].startswith("call_")
+        # Arguments should be a JSON string
+        args = json.loads(tcs[0]["function"]["arguments"])
+        assert args == {"file_path": "/tmp/a.txt"}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 14d. VRAM-aware model selection
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestVramAwareModelSelection:
+
+    def test_vram_used_for_model_selection(self):
+        """On Linux with NVIDIA GPU, VRAM should influence model selection."""
+        cfg = vc.Config()
+        cfg.ollama_host = "http://localhost:11434"
+        # Simulate: low RAM (8GB) but high VRAM (48GB)
+        with mock.patch.object(vc, '_get_ram_gb', return_value=8):
+            with mock.patch.object(vc, '_get_vram_gb', return_value=48):
+                with mock.patch.object(cfg, '_query_installed_models', return_value=[]):
+                    cfg._auto_detect_model()
+        # With effective_mem=48GB, should pick large model
+        assert cfg.model == "qwen3-coder:30b"
+
+    def test_vram_zero_falls_back_to_ram(self):
+        """When no GPU detected (vram=0), should use RAM only."""
+        cfg = vc.Config()
+        cfg.ollama_host = "http://localhost:11434"
+        with mock.patch.object(vc, '_get_ram_gb', return_value=8):
+            with mock.patch.object(vc, '_get_vram_gb', return_value=0):
+                with mock.patch.object(cfg, '_query_installed_models', return_value=[]):
+                    cfg._auto_detect_model()
+        # 8GB RAM → small model
+        assert cfg.model == "qwen3:1.7b"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1489,30 +1655,62 @@ class TestSessionTokenEstimation:
 # Round 3 CRITICAL Fix Regression Tests
 # ═══════════════════════════════════════════════════════════════════════════
 
-class TestSSEStreamCleanup:
-    """Test that _iter_sse properly closes HTTP response."""
+class TestNDJSONStreamCleanup:
+    """Test that _iter_ndjson properly closes HTTP response."""
 
     def test_response_closed_on_done(self):
-        """HTTP response should be closed when [DONE] is received."""
+        """HTTP response should be closed when done:true is received."""
         client = vc.OllamaClient.__new__(vc.OllamaClient)
         client.debug = False
         mock_resp = mock.MagicMock()
         mock_resp.read.side_effect = [
-            b'data: {"choices":[{"delta":{"content":"hi"}}]}\n',
-            b'data: [DONE]\n',
+            b'{"message":{"role":"assistant","content":"hi"},"done":false}\n',
+            b'{"message":{"role":"assistant","content":""},"done":true}\n',
         ]
-        chunks = list(client._iter_sse(mock_resp))
-        assert len(chunks) == 1
+        chunks = list(client._iter_ndjson(mock_resp))
+        # First chunk has content, second is done marker
+        assert any(c["choices"][0]["delta"].get("content") == "hi" for c in chunks)
         mock_resp.close.assert_called_once()
 
     def test_response_closed_on_empty(self):
-        """HTTP response should be closed when stream ends without DONE."""
+        """HTTP response should be closed when stream ends without done."""
         client = vc.OllamaClient.__new__(vc.OllamaClient)
         client.debug = False
         mock_resp = mock.MagicMock()
-        mock_resp.read.side_effect = [b'data: {"choices":[{"delta":{}}]}\n', b'']
-        chunks = list(client._iter_sse(mock_resp))
+        mock_resp.read.side_effect = [
+            b'{"message":{"role":"assistant","content":""},"done":false}\n',
+            b'',
+        ]
+        chunks = list(client._iter_ndjson(mock_resp))
         mock_resp.close.assert_called_once()
+
+    def test_ndjson_tool_calls_converted(self):
+        """Tool calls in NDJSON stream should be converted to OpenAI delta format."""
+        client = vc.OllamaClient.__new__(vc.OllamaClient)
+        client.debug = False
+        mock_resp = mock.MagicMock()
+        tool_line = json.dumps({
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"function": {"name": "Read", "arguments": {"file_path": "/tmp/a.txt"}}}],
+            },
+            "done": True,
+            "eval_count": 10,
+            "prompt_eval_count": 5,
+        }).encode() + b"\n"
+        mock_resp.read.side_effect = [tool_line, b'']
+        chunks = list(client._iter_ndjson(mock_resp))
+        assert len(chunks) >= 1
+        last = chunks[-1]
+        tc_deltas = last["choices"][0]["delta"].get("tool_calls", [])
+        assert len(tc_deltas) == 1
+        assert tc_deltas[0]["function"]["name"] == "Read"
+        # Arguments should be a JSON string (OpenAI format)
+        assert '"file_path"' in tc_deltas[0]["function"]["arguments"]
+        # Usage should be present on done chunk
+        assert last["usage"]["prompt_tokens"] == 5
+        assert last["usage"]["completion_tokens"] == 10
 
 
 class TestToolCallDeduplication:
@@ -2728,7 +2926,7 @@ class TestOllamaClientChatErrors:
         client = self._make_client()
         import urllib.error
         error = urllib.error.HTTPError(
-            url="http://localhost:11434/v1/chat/completions",
+            url="http://localhost:11434/api/chat",
             code=400, msg="Bad Request", hdrs=None,
             fp=mock.MagicMock(read=mock.MagicMock(return_value=b"context length exceeded")),
         )
@@ -2740,7 +2938,7 @@ class TestOllamaClientChatErrors:
         client = self._make_client()
         import urllib.error
         error = urllib.error.HTTPError(
-            url="http://localhost:11434/v1/chat/completions",
+            url="http://localhost:11434/api/chat",
             code=500, msg="Internal Server Error", hdrs=None,
             fp=mock.MagicMock(read=mock.MagicMock(return_value=b"internal error")),
         )
@@ -2770,8 +2968,10 @@ class TestChatToolModePayload:
 
         captured = {}
         mock_resp = mock.MagicMock()
+        # Native /api/chat format response
         mock_resp.read.return_value = json.dumps({
-            "choices": [{"message": {"content": "hello", "tool_calls": []}}]
+            "message": {"role": "assistant", "content": "hello"},
+            "done": True,
         }).encode()
 
         def capture_urlopen(req, **kwargs):
@@ -2783,7 +2983,8 @@ class TestChatToolModePayload:
             client.chat("model", [{"role": "user", "content": "hi"}], tools=tools, stream=True)
 
         assert captured["data"]["stream"] is False
-        assert captured["data"]["temperature"] <= 0.3
+        # Temperature is now in options (native API format)
+        assert captured["data"]["options"]["temperature"] <= 0.3
 
 
 class TestEditToolValidation:

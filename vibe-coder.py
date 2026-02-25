@@ -957,28 +957,32 @@ class Config:
             self._apply_context_window(self.model)
             return
         ram_gb = _get_ram_gb()
+        # On non-macOS, also consider GPU VRAM for model selection
+        # (Apple Silicon uses unified memory, so ram_gb already covers it)
+        vram_gb = _get_vram_gb()
+        effective_mem_gb = max(ram_gb, vram_gb) if vram_gb > 0 else ram_gb
         # Try smart detection: query Ollama for installed models
         installed = self._query_installed_models()
         if installed:
-            best = self._pick_best_model(installed, ram_gb)
+            best = self._pick_best_model(installed, effective_mem_gb)
             if best:
                 self.model = best
                 self._apply_context_window(best)
                 if not self.sidecar_model:
-                    self._pick_sidecar(installed, best, ram_gb)
+                    self._pick_sidecar(installed, best, effective_mem_gb)
                 return
         # Fallback: RAM-based heuristic (no Ollama connection yet)
-        if ram_gb >= 32:
+        if effective_mem_gb >= 32:
             self.model = "qwen3-coder:30b"
-        elif ram_gb >= 16:
+        elif effective_mem_gb >= 16:
             self.model = "qwen3:8b"
         else:
             self.model = "qwen3:1.7b"
             self.context_window = 4096
         if not self.sidecar_model:
-            if ram_gb >= 32:
+            if effective_mem_gb >= 32:
                 self.sidecar_model = "qwen3:8b"
-            elif ram_gb >= 16:
+            elif effective_mem_gb >= 16:
                 self.sidecar_model = "qwen3:1.7b"
 
     def _query_installed_models(self):
@@ -1149,6 +1153,37 @@ def _get_ram_gb():
     except Exception:
         pass
     return 16  # fallback assumption
+
+
+def _get_vram_gb():
+    """Detect total GPU VRAM in GB via nvidia-smi.
+
+    Returns the VRAM of the first NVIDIA GPU in GB, or 0 if detection fails
+    (no NVIDIA GPU, nvidia-smi not installed, etc.).
+    On macOS with Apple Silicon, VRAM == system RAM (unified memory), so this
+    returns 0 and callers should just use _get_ram_gb().
+    """
+    if platform.system() == "Darwin":
+        return 0  # Apple Silicon unified memory — use _get_ram_gb() instead
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            # nvidia-smi reports in MiB; take the largest GPU if multiple
+            vram_values = []
+            for line in result.stdout.strip().split("\n"):
+                line = line.strip()
+                if line.isdigit():
+                    vram_values.append(int(line))
+            if vram_values:
+                return max(vram_values) // 1024  # MiB → GiB
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        pass  # nvidia-smi not available
+    except Exception:
+        pass
+    return 0
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -1463,40 +1498,128 @@ class OllamaClient:
         finally:
             resp.close()
 
-    def chat(self, model, messages, tools=None, stream=True):
-        """Send chat completion request. Returns an iterator of SSE chunks if streaming."""
-        payload = {
-            "model": model,
-            "messages": messages,
-            "max_tokens": self.max_tokens,
-            "temperature": self.temperature,
-            "stream": stream,
-            "keep_alive": -1,  # Keep model loaded in VRAM for the session
-            "options": {"num_ctx": self.context_window},  # Tell Ollama our context budget
+    @staticmethod
+    def _prepare_messages_for_native(messages):
+        """Convert messages from internal/OpenAI format to Ollama native /api/chat format.
+
+        - tool_calls arguments: str → dict (native API requires dict)
+        - multipart image content: [{type: image_url, ...}] → images: [base64]
+        - Extra fields (tool_call_id, type on tool_calls) are kept; Ollama ignores unknown fields.
+        """
+        result = []
+        for msg in messages:
+            m = dict(msg)  # shallow copy
+            # Convert assistant tool_calls: arguments str→dict, strip OpenAI-only fields
+            if m.get("tool_calls"):
+                native_tcs = []
+                for tc in m["tool_calls"]:
+                    fn = tc.get("function", {})
+                    args = fn.get("arguments", "{}")
+                    if isinstance(args, str):
+                        try:
+                            args = json.loads(args)
+                        except (json.JSONDecodeError, ValueError):
+                            args = {}
+                    native_tcs.append({"function": {"name": fn.get("name", ""), "arguments": args}})
+                m["tool_calls"] = native_tcs
+            # Convert multipart image content to native images field
+            if isinstance(m.get("content"), list):
+                texts = []
+                images = []
+                for part in m["content"]:
+                    if isinstance(part, dict):
+                        if part.get("type") == "text":
+                            texts.append(part.get("text", ""))
+                        elif part.get("type") == "image_url":
+                            url = part.get("image_url", {}).get("url", "")
+                            # Extract base64 from data URI: data:image/png;base64,<data>
+                            if url.startswith("data:") and ";base64," in url:
+                                b64 = url.split(";base64,", 1)[1]
+                                images.append(b64)
+                m["content"] = " ".join(texts) if texts else ""
+                if images:
+                    m["images"] = images
+            result.append(m)
+        return result
+
+    @staticmethod
+    def _native_to_openai_response(data):
+        """Convert Ollama native /api/chat response to OpenAI-compatible format.
+
+        This adapter lets all downstream consumers (show_sync_response, chat_sync,
+        token reconciliation) work without changes.
+        """
+        message = data.get("message", {})
+        raw_tool_calls = message.get("tool_calls") or []
+        # Convert tool_calls: arguments dict→str, add id/type fields
+        openai_tcs = []
+        for tc in raw_tool_calls:
+            fn = tc.get("function", {})
+            args = fn.get("arguments", {})
+            if isinstance(args, dict):
+                args = json.dumps(args)
+            openai_tcs.append({
+                "id": f"call_{uuid.uuid4().hex[:8]}",
+                "type": "function",
+                "function": {"name": fn.get("name", ""), "arguments": args},
+            })
+        openai_msg = {
+            "role": message.get("role", "assistant"),
+            "content": message.get("content", "") or "",
         }
+        if openai_tcs:
+            openai_msg["tool_calls"] = openai_tcs
+        return {
+            "choices": [{"message": openai_msg, "finish_reason": "stop"}],
+            "usage": {
+                "prompt_tokens": data.get("prompt_eval_count", 0) or 0,
+                "completion_tokens": data.get("eval_count", 0) or 0,
+            },
+        }
+
+    def chat(self, model, messages, tools=None, stream=True):
+        """Send chat request via Ollama native /api/chat.
+
+        Uses the native API (not /v1/chat/completions) so that options like
+        num_ctx are properly respected.  Returns OpenAI-compatible format via
+        an adapter layer so all downstream consumers work unchanged.
+        """
+        temp = self.temperature
         if tools:
-            payload["tools"] = tools
-            payload["tool_choice"] = "auto"
             # Lower temperature for tool-calling (improves JSON reliability)
-            payload["temperature"] = min(self.temperature, 0.3)
+            temp = min(self.temperature, 0.3)
             # Auto-detect streaming with tools (Ollama 0.5+ supports this)
             if not self.detect_tool_streaming():
                 if stream:
-                    payload["stream"] = False
                     stream = False
+
+        api_messages = self._prepare_messages_for_native(messages)
+        payload = {
+            "model": model,
+            "messages": api_messages,
+            "stream": stream,
+            "keep_alive": -1,  # Keep model loaded in VRAM for the session
+            "options": {
+                "num_ctx": self.context_window,
+                "num_predict": self.max_tokens,
+                "temperature": temp,
+            },
+        }
+        if tools:
+            payload["tools"] = tools
 
         body = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
-            f"{self.base_url}/v1/chat/completions",
+            f"{self.base_url}/api/chat",
             data=body,
             headers={"Content-Type": "application/json"},
             method="POST",
         )
 
         if self.debug:
-            print(f"{C.DIM}[debug] POST {self.base_url}/v1/chat/completions "
+            print(f"{C.DIM}[debug] POST {self.base_url}/api/chat "
                   f"model={model} msgs={len(messages)} tools={len(tools or [])} "
-                  f"stream={stream}{C.RESET}", file=sys.stderr)
+                  f"stream={stream} num_ctx={self.context_window}{C.RESET}", file=sys.stderr)
 
         try:
             resp = urllib.request.urlopen(req, timeout=self.timeout)
@@ -1527,7 +1650,7 @@ class OllamaClient:
                 raise RuntimeError(f"Ollama HTTP error {e.code}: {error_body}") from e
 
         if stream:
-            return self._iter_sse(resp)
+            return self._iter_ndjson(resp)
         else:
             try:
                 raw = resp.read(10 * 1024 * 1024)  # 10MB safety cap
@@ -1537,25 +1660,28 @@ class OllamaClient:
                 data = json.loads(raw)
             except json.JSONDecodeError as e:
                 raise RuntimeError(f"Invalid JSON from Ollama: {raw[:200]}") from e
+            openai_resp = self._native_to_openai_response(data)
             if self.debug:
-                usage = data.get("usage", {})
+                usage = openai_resp.get("usage", {})
                 print(f"{C.DIM}[debug] Response: prompt={usage.get('prompt_tokens',0)} "
                       f"completion={usage.get('completion_tokens',0)}{C.RESET}", file=sys.stderr)
-            return data
+            return openai_resp
 
-    def _iter_sse(self, resp):
-        """Iterate over SSE stream from Ollama."""
+    def _iter_ndjson(self, resp):
+        """Iterate over NDJSON stream from Ollama native /api/chat.
+
+        Each line is a complete JSON object.  Yields chunks converted to
+        OpenAI delta format so stream_response() works without changes.
+        """
         buf = b""
         MAX_BUF = 1024 * 1024  # 1MB safety limit
-        got_data = False
-        got_done = False
         try:
             while True:
                 try:
                     chunk = resp.read(4096)
                 except (ConnectionError, OSError, urllib.error.URLError) as e:
                     if self.debug:
-                        print(f"\n{C.YELLOW}[debug] SSE stream read error: {e}{C.RESET}",
+                        print(f"\n{C.YELLOW}[debug] NDJSON stream read error: {e}{C.RESET}",
                               file=sys.stderr)
                     break
                 except Exception:
@@ -1569,22 +1695,51 @@ class OllamaClient:
                 while b"\n" in buf:
                     line_bytes, buf = buf.split(b"\n", 1)
                     line = line_bytes.decode("utf-8", errors="replace").strip()
-                    if not line.startswith("data: "):
+                    if not line:
                         continue
-                    data_str = line[6:]
-                    if data_str == "[DONE]":
-                        got_done = True
-                        return
                     try:
-                        chunk_data = json.loads(data_str)
-                        got_data = True
-                        yield chunk_data
+                        data = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-            # If stream ended without [DONE] and we got data, it was likely a disconnect
-            if got_data and not got_done and self.debug:
-                print(f"{C.YELLOW}[debug] Stream ended without [DONE] marker{C.RESET}",
-                      file=sys.stderr)
+
+                    message = data.get("message", {})
+                    done = data.get("done", False)
+
+                    # Build OpenAI-compatible delta
+                    delta = {}
+                    content = message.get("content", "")
+                    if content:
+                        delta["content"] = content
+
+                    raw_tool_calls = message.get("tool_calls") or []
+                    if raw_tool_calls:
+                        openai_tcs = []
+                        for i, tc in enumerate(raw_tool_calls):
+                            fn = tc.get("function", {})
+                            args = fn.get("arguments", {})
+                            if isinstance(args, dict):
+                                args = json.dumps(args)
+                            openai_tcs.append({
+                                "index": i,
+                                "id": f"call_{uuid.uuid4().hex[:8]}",
+                                "function": {"name": fn.get("name", ""), "arguments": args},
+                            })
+                        delta["tool_calls"] = openai_tcs
+
+                    openai_chunk = {
+                        "choices": [{"delta": delta, "finish_reason": "stop" if done else None}],
+                    }
+                    # Attach usage on the final chunk
+                    if done:
+                        openai_chunk["usage"] = {
+                            "prompt_tokens": data.get("prompt_eval_count", 0) or 0,
+                            "completion_tokens": data.get("eval_count", 0) or 0,
+                        }
+
+                    yield openai_chunk
+
+                    if done:
+                        return
         finally:
             try:
                 resp.close()
