@@ -1287,6 +1287,261 @@ class TestOllamaClient:
         # Fallback: len // 4
         assert count == len("hello world test") // 4
 
+    def test_chat_converts_tool_call_arguments_to_dict(self):
+        """OllamaClient.chat must convert tool_call arguments from JSON strings
+        (OpenAI format stored internally) to dicts before sending to Ollama
+        native /api/chat, which expects arguments as objects."""
+        client = self._make_client()
+        client._tool_streaming = True  # skip detect call
+
+        sent_bodies = []
+
+        def fake_urlopen(req, timeout=None):
+            sent_bodies.append(json.loads(req.data.decode()))
+            resp = mock.MagicMock()
+            # Minimal streaming response with a single done chunk
+            resp.read.side_effect = [
+                json.dumps({
+                    "model": "qwen3:8b",
+                    "message": {"role": "assistant", "content": ""},
+                    "done": True,
+                    "done_reason": "stop",
+                }).encode() + b"\n",
+                b"",
+            ]
+            resp.__iter__ = lambda s: iter([])
+            return resp
+
+        messages = [
+            {"role": "user", "content": "ls"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": "call_abc",
+                    "type": "function",
+                    "function": {
+                        "name": "Bash",
+                        "arguments": '{"command": "ls -la"}',  # string, OpenAI format
+                    },
+                }],
+            },
+            {"role": "tool", "tool_call_id": "call_abc", "content": "file.txt"},
+        ]
+
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            list(client.chat("qwen3:8b", messages, stream=True))
+
+        assert len(sent_bodies) == 1, "Expected exactly one POST"
+        sent = sent_bodies[0]
+        # Find the assistant message in the body sent to Ollama
+        assistant_msg = next(
+            m for m in sent["messages"] if m.get("role") == "assistant"
+        )
+        tc_args = assistant_msg["tool_calls"][0]["function"]["arguments"]
+        assert isinstance(tc_args, dict), (
+            f"Expected arguments to be a dict, got {type(tc_args)}: {tc_args!r}"
+        )
+        assert tc_args == {"command": "ls -la"}
+
+    def test_chat_handles_already_dict_arguments(self):
+        """If arguments are already a dict (e.g., read from Ollama response),
+        they should be passed through unchanged."""
+        client = self._make_client()
+        client._tool_streaming = True
+
+        sent_bodies = []
+
+        def fake_urlopen(req, timeout=None):
+            sent_bodies.append(json.loads(req.data.decode()))
+            resp = mock.MagicMock()
+            resp.read.side_effect = [
+                json.dumps({
+                    "model": "qwen3:8b",
+                    "message": {"role": "assistant", "content": ""},
+                    "done": True,
+                    "done_reason": "stop",
+                }).encode() + b"\n",
+                b"",
+            ]
+            return resp
+
+        messages = [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": "call_xyz",
+                    "type": "function",
+                    "function": {
+                        "name": "Bash",
+                        "arguments": {"command": "pwd"},  # already a dict
+                    },
+                }],
+            },
+        ]
+
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            list(client.chat("qwen3:8b", messages, stream=True))
+
+        assistant_msg = next(
+            m for m in sent_bodies[0]["messages"] if m.get("role") == "assistant"
+        )
+        tc_args = assistant_msg["tool_calls"][0]["function"]["arguments"]
+        assert isinstance(tc_args, dict)
+        assert tc_args == {"command": "pwd"}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 13b. TUI.stream_response
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestTUIStreamResponse:
+    """Tests for TUI.stream_response — streaming text accumulation and
+    XML-fallback tool call extraction (used by Qwen models on Ollama native API)."""
+
+    def _make_tui(self):
+        cfg = vc.Config()
+        cfg.history_file = "/dev/null"
+        with mock.patch.object(vc.readline, "read_history_file", side_effect=Exception("skip")):
+            tui = vc.TUI(cfg)
+        return tui
+
+    def _make_chunks(self, contents, done_content=""):
+        """Build a list of Ollama native API streaming chunk dicts."""
+        chunks = [
+            {"model": "qwen3:8b",
+             "message": {"role": "assistant", "content": c},
+             "done": False}
+            for c in contents
+        ]
+        chunks.append({
+            "model": "qwen3:8b",
+            "message": {"role": "assistant", "content": done_content},
+            "done": True,
+            "done_reason": "stop",
+        })
+        return iter(chunks)
+
+    def test_plain_text_accumulation(self, capsys):
+        """stream_response should concatenate content chunks into full_text."""
+        tui = self._make_tui()
+        chunks = self._make_chunks(["Hello", ", ", "world", "!"])
+        text, tool_calls = tui.stream_response(chunks)
+        assert text == "Hello, world!"
+        assert tool_calls == []
+
+    def test_think_tag_stripped_from_full_text(self, capsys):
+        """<think>...</think> blocks must be removed from the returned full_text."""
+        tui = self._make_tui()
+        chunks = self._make_chunks(["<think>", "reasoning here", "</think>", "Answer"])
+        text, tool_calls = tui.stream_response(chunks)
+        assert "<think>" not in text
+        assert "reasoning here" not in text
+        assert "Answer" in text
+
+    def test_xml_tool_call_extracted_from_stream(self):
+        """When model emits XML-style tool calls in text, stream_response must
+        extract them into tool_calls and remove them from the returned text."""
+        tui = self._make_tui()
+        # Simulate Qwen streaming <function=Bash>...\n</function>
+        xml_parts = [
+            "<function=Bash>",
+            "\n<parameter=command>",
+            "ls -la",
+            "</parameter>",
+            "\n</function>",
+        ]
+        chunks = self._make_chunks(xml_parts)
+        known_tools = ["Bash", "Read", "Write"]
+        text, tool_calls = tui.stream_response(chunks, known_tools=known_tools)
+        assert len(tool_calls) == 1, f"Expected 1 tool call, got: {tool_calls}"
+        assert tool_calls[0]["function"]["name"] == "Bash"
+        args = json.loads(tool_calls[0]["function"]["arguments"])
+        assert args["command"] == "ls -la"
+        # XML tag should not appear in the returned text
+        assert "<function=" not in text
+
+    def test_xml_invoke_style_extracted_from_stream(self):
+        """stream_response should also handle <invoke name='Tool'> XML format."""
+        tui = self._make_tui()
+        xml_parts = [
+            '<invoke name="Read">',
+            '<parameter name="file_path">/etc/hosts</parameter>',
+            '</invoke>',
+        ]
+        chunks = self._make_chunks(xml_parts)
+        text, tool_calls = tui.stream_response(chunks, known_tools=["Read", "Bash"])
+        assert len(tool_calls) == 1
+        assert tool_calls[0]["function"]["name"] == "Read"
+        args = json.loads(tool_calls[0]["function"]["arguments"])
+        assert args["file_path"] == "/etc/hosts"
+
+    def test_no_xml_extraction_when_native_tool_calls_present(self):
+        """If Ollama returns native tool_calls in the chunk, XML extraction
+        should NOT double-parse them (streamed_tool_calls takes priority)."""
+        tui = self._make_tui()
+
+        # Simulate a chunk with a native tool_call delta
+        chunks = iter([
+            {
+                "model": "qwen3:8b",
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_native",
+                        "type": "function",
+                        "function": {"name": "Bash", "arguments": '{"command":"pwd"}'},
+                    }],
+                },
+                "done": False,
+            },
+            {
+                "model": "qwen3:8b",
+                "message": {"role": "assistant", "content": ""},
+                "done": True,
+                "done_reason": "stop",
+            },
+        ])
+        text, tool_calls = tui.stream_response(chunks, known_tools=["Bash"])
+        assert len(tool_calls) == 1
+        assert tool_calls[0]["id"] == "call_native"
+        # No double extraction
+        assert len(tool_calls) == 1
+
+    def test_empty_stream(self):
+        """An empty stream should return empty text and no tool calls."""
+        tui = self._make_tui()
+        chunks = iter([{
+            "model": "qwen3:8b",
+            "message": {"role": "assistant", "content": ""},
+            "done": True,
+            "done_reason": "stop",
+        }])
+        text, tool_calls = tui.stream_response(chunks)
+        assert text == ""
+        assert tool_calls == []
+
+    def test_openai_format_chunk_compatibility(self):
+        """stream_response should still work with OpenAI-compatible chunk format."""
+        tui = self._make_tui()
+        chunks = iter([
+            {
+                "choices": [{"delta": {"content": "Hi"}}],
+            },
+            {
+                "choices": [{"delta": {"content": " there"}}],
+            },
+            {
+                "choices": [{"delta": {}, "finish_reason": "stop"}],
+            },
+        ])
+        text, tool_calls = tui.stream_response(chunks)
+        assert text == "Hi there"
+        assert tool_calls == []
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 14. _get_ram_gb
